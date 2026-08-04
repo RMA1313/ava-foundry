@@ -7,4 +7,7 @@ RUN apt-get update \
 
 RUN corepack enable
 
-CMD ["sh", "-lc", "pnpm --dir packages/frontend install --force --frozen-lockfile && pnpm --dir packages/frontend dev --host 0.0.0.0 --port 5173"]
+COPY packages/frontend/package.json packages/frontend/pnpm-lock.yaml packages/frontend/pnpm-workspace.yaml packages/frontend/
+RUN pnpm --dir packages/frontend install --frozen-lockfile
+
+CMD ["pnpm", "--dir", "packages/frontend", "dev", "--host", "0.0.0.0", "--port", "5173"]

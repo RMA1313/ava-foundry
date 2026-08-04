@@ -2,71 +2,61 @@ name: ci
 
 on:
   push:
+    paths-ignore:
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   changes:
-    name: Detect changed ecosystems
+    name: Detect changed paths
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
       frontend: ${{ steps.filter.outputs.frontend }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Detect changed files
+      - name: Detect changed paths
         id: filter
-        shell: bash
-        env:
-          EVENT_BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            base_ref="origin/${GITHUB_BASE_REF}"
-            git fetch --no-tags --prune --depth=1 origin "${GITHUB_BASE_REF}"
-            diff_range="${base_ref}...${GITHUB_SHA}"
-          else
-            if [[ -z "${EVENT_BEFORE:-}" || "${EVENT_BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
-              diff_range=""
-            else
-              diff_range="${EVENT_BEFORE}...${GITHUB_SHA}"
-            fi
-          fi
-
-          if [[ -n "${diff_range}" ]]; then
-            changed_files="$(git diff --name-only "${diff_range}")"
-          else
-            changed_files="$(git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}")"
-          fi
-
-          rust=false
-          python=false
-          frontend=false
-
-          if [[ -n "${changed_files}" ]]; then
-            if printf '%s\n' "${changed_files}" | grep -Eq '^(Cargo\.toml|Cargo\.lock|crates/backend/|\.github/workflows/ci\.yml|\.github/dependabot\.yml)'; then
-              rust=true
-            fi
-
-            if printf '%s\n' "${changed_files}" | grep -Eq '^(services/inference-worker/|\.github/workflows/ci\.yml|\.github/dependabot\.yml)'; then
-              python=true
-            fi
-
-            if printf '%s\n' "${changed_files}" | grep -Eq '^(packages/frontend/|\.github/workflows/ci\.yml|\.github/dependabot\.yml)'; then
-              frontend=true
-            fi
-          fi
-
-          {
-            echo "rust=${rust}"
-            echo "python=${python}"
-            echo "frontend=${frontend}"
-          } >> "${GITHUB_OUTPUT}"
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/backend/**'
+              - '.github/workflows/ci.yml'
+              - '.github/dependabot.yml'
+            python:
+              - 'services/inference-worker/**'
+              - '.github/workflows/ci.yml'
+              - '.github/dependabot.yml'
+            frontend:
+              - 'packages/frontend/**'
+              - '.github/workflows/ci.yml'
+              - '.github/dependabot.yml'
+            docker:
+              - 'docker/**'
+              - 'docker-compose.yml'
+              - '.github/workflows/ci.yml'
+              - '.github/dependabot.yml'
 
   rust:
     name: Rust
@@ -91,6 +81,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
             crates/backend/target
           key: ${{ runner.os }}-rust-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/backend/Cargo.toml') }}
@@ -168,3 +159,35 @@ jobs:
 
       - name: pnpm build
         run: pnpm build
+
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            file: docker/backend.Dockerfile
+          - name: frontend
+            file: docker/frontend.Dockerfile
+          - name: inference-worker
+            file: docker/inference-worker.Dockerfile
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
