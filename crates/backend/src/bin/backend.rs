@@ -7,7 +7,7 @@ use backend::{
     db::Database,
     server::{self, AppState},
     storage::AudioStorageConfig,
-    worker::{DefaultFilesystemMetrics, StagingCapacityGuard},
+    worker::{DefaultFilesystemMetrics, StagingCapacityGuard, WorkerRuntime},
 };
 use tracing::info;
 
@@ -30,15 +30,15 @@ async fn main() -> Result<()> {
         DefaultFilesystemMetrics,
     ));
     let audio_storage = AudioStorageConfig::new(config.audio_dir, config.audio_temp_dir);
-    server::serve(
-        addr,
-        AppState {
-            database,
-            staging_dir: config.temp_dir,
-            audio_storage,
-            audio_normalization_profile: config.audio_normalization_profile,
-            staging_capacity_guard,
-        },
-    )
-    .await
+    let state = AppState {
+        database,
+        staging_dir: config.temp_dir,
+        audio_storage,
+        audio_normalization_profile: config.audio_normalization_profile,
+        staging_capacity_guard,
+    };
+    WorkerRuntime::new("startup-recovery".to_string())
+        .recover_abandoned_temp_outputs(&state)
+        .await?;
+    server::serve(addr, state).await
 }

@@ -255,6 +255,28 @@ impl WorkerRuntime {
         Ok(())
     }
 
+    pub async fn recover_abandoned_temp_outputs(&self, state: &AppState) -> Result<()> {
+        let temp_root = &state.audio_storage.temporary_root;
+        if !temp_root.exists() {
+            return Ok(());
+        }
+        let mut stack = vec![temp_root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn claim_and_spawn(
         &self,
         state: AppState,
@@ -386,6 +408,10 @@ pub fn audio_validation_handler(
         let ffprobe_path = ffprobe_path.clone();
         async move { handle_audio_validation_job(&state, job, &ffmpeg_path, &ffprobe_path).await }
     }
+}
+
+pub fn video_cleanup_handler() -> impl JobHandler {
+    move |job: Job, state: AppState| async move { handle_video_cleanup_job(&state, job).await }
 }
 
 async fn handle_media_ingestion_job(
@@ -1626,6 +1652,190 @@ mod tests {
         assert_eq!(current_job.status, JobStatus::Running);
     }
 
+    #[tokio::test]
+    async fn cleanup_job_is_idempotent_and_preserves_permanent_audio() {
+        clear_env();
+        let pool = test_pool().await;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (project_id, _source_id, media_asset_id) = seed_inspectable_media_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let staged_path = temp_dir.path().join("staging").join("source.bin");
+        if let Some(parent) = staged_path.parent() {
+            fs::create_dir_all(parent).expect("staging parent");
+        }
+        fs::write(&staged_path, b"video").expect("staged file");
+        let permanent_path = temp_dir.path().join("audio").join("audio-assets");
+        fs::create_dir_all(&permanent_path).expect("permanent parent");
+        let permanent_file = permanent_path.join(format!("{}.flac", Uuid::new_v4()));
+        fs::write(&permanent_file, b"audio").expect("permanent audio");
+        sqlx::query(
+            r#"
+            update media_assets
+            set staged_path = $2,
+                extraction_status = 'completed',
+                extraction_progress = 'validated',
+                extraction_tmp_path = $3,
+                updated_at = now()
+            where id = $1
+            "#,
+        )
+        .bind(media_asset_id)
+        .bind(staged_path.to_string_lossy().to_string())
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("media asset should update");
+        sqlx::query(
+            r#"
+            insert into audio_assets (
+                id, media_asset_id, project_id, processing_status, duration_seconds,
+                normalization_profile, validation_status, validation_error, validated_at,
+                audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
+                created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, null, now(), $8, $9, $10, $11, $12, $13, now(), now())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(media_asset_id)
+        .bind(project_id)
+        .bind("validated")
+        .bind(12.5_f64)
+        .bind(Some("flac:flac:16000:1"))
+        .bind(Some("validated"))
+        .bind("flac")
+        .bind("flac")
+        .bind(16000_i32)
+        .bind(1_i32)
+        .bind(5_i64)
+        .bind(permanent_file.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .expect("audio asset should insert");
+        let job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(media_asset_id),
+                JobType::VideoCleanup,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("cleanup job should be created");
+        let claimed = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("claim should succeed")
+            .expect("cleanup job should be claimable");
+        assert_eq!(claimed.id, job.id);
+        let runtime = WorkerRuntime::new("worker-test".to_string())
+            .with_handler(JobType::VideoCleanup, video_cleanup_handler());
+        let handlers = runtime.handlers.clone();
+        runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                    staging_dir: temp_dir.path().join("staging"),
+                    audio_storage: AudioStorageConfig::new(
+                        temp_dir.path().join("audio"),
+                        temp_dir.path().join("audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                claimed,
+            )
+            .await
+            .expect("cleanup should succeed");
+        assert!(!staged_path.exists());
+        assert!(permanent_file.exists());
+        let media_asset = database
+            .media_assets()
+            .get(media_asset_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(media_asset.extraction_status.as_deref(), Some("cleaned"));
+        let repeated = handle_video_cleanup_job(
+            &AppState {
+                database: database.clone(),
+                staging_dir: temp_dir.path().join("staging"),
+                audio_storage: AudioStorageConfig::new(
+                    temp_dir.path().join("audio"),
+                    temp_dir.path().join("audio-tmp"),
+                ),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            },
+            Job {
+                id: Uuid::new_v4(),
+                project_id,
+                source_id: Some(media_asset_id),
+                job_type: JobType::VideoCleanup,
+                status: JobStatus::Running,
+                priority: 0,
+                attempts: 0,
+                available_at: Utc::now(),
+                lease_expires_at: None,
+                worker_id: None,
+                failure_reason: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        )
+        .await;
+        assert!(repeated.is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_sweeps_abandoned_temp_outputs_without_touching_finalized_audio() {
+        clear_env();
+        let pool = test_pool().await;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let database = Database::from_pool(pool);
+        let temp_root = temp_dir.path().join("audio-tmp");
+        let final_root = temp_dir.path().join("audio");
+        let abandoned_tmp = temp_root.join("audio-normalization").join("abandoned.tmp");
+        if let Some(parent) = abandoned_tmp.parent() {
+            fs::create_dir_all(parent).expect("temp parent");
+        }
+        fs::write(&abandoned_tmp, b"partial").expect("partial file");
+        let finalized = final_root.join("audio-assets").join("final.flac");
+        if let Some(parent) = finalized.parent() {
+            fs::create_dir_all(parent).expect("final parent");
+        }
+        fs::write(&finalized, b"audio").expect("finalized file");
+        let runtime = WorkerRuntime::new("worker-test".to_string());
+        runtime
+            .recover_abandoned_temp_outputs(&AppState {
+                database,
+                staging_dir: temp_dir.path().join("staging"),
+                audio_storage: AudioStorageConfig::new(final_root, temp_root.clone()),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            })
+            .await
+            .expect("recovery should succeed");
+        assert!(!abandoned_tmp.exists());
+        assert!(finalized.exists());
+    }
+
     #[test]
     fn staging_capacity_guard_uses_hysteresis() {
         let metrics = FakeFilesystemMetrics::new(5, 10);
@@ -2027,8 +2237,97 @@ async fn complete_audio_validation(
     if job_update.rows_affected() != 1 {
         return Err(anyhow!("job not found"));
     }
+    sqlx::query(
+        r#"
+        insert into jobs (
+            id, project_id, source_id, job_type, status,
+            priority, attempts, available_at, lease_expires_at,
+            worker_id, failure_reason, created_at, updated_at
+        )
+        values ($1, $2, $3, 'video_cleanup', 'queued', 0, 0, now(), null, null, null, now(), now())
+        on conflict (project_id, source_id, job_type)
+        do update set updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(media_asset.project_id)
+    .bind(media_asset.id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
+}
+
+async fn handle_video_cleanup_job(state: &AppState, job: Job) -> Result<JobOutcome> {
+    let media_asset_id = job
+        .source_id
+        .ok_or_else(|| anyhow!("video cleanup job requires a media asset id"))?;
+    let media_asset = state
+        .database
+        .media_assets()
+        .get(media_asset_id)
+        .await?
+        .ok_or_else(|| anyhow!("media asset not found"))?;
+    let audio_asset = state
+        .database
+        .audio_assets()
+        .get_by_media_asset(media_asset_id)
+        .await?
+        .ok_or_else(|| anyhow!("audio asset not found"))?;
+    if audio_asset.validation_status.as_deref() != Some("validated") {
+        return Ok(JobOutcome::Failed {
+            failure_reason: "audio asset is not finalized".to_string(),
+        });
+    }
+
+    if let Some(temp_path) = media_asset.extraction_tmp_path.as_deref() {
+        if temp_path.starts_with(
+            state
+                .audio_storage
+                .temporary_root
+                .to_string_lossy()
+                .as_ref(),
+        ) && std::fs::metadata(temp_path).is_ok()
+        {
+            if let Err(err) = std::fs::remove_file(temp_path) {
+                return Ok(JobOutcome::Retry {
+                    failure_reason: err.to_string(),
+                    retry_after: Utc::now() + chrono::Duration::minutes(5),
+                });
+            }
+        }
+    }
+
+    let staged_path = Path::new(&media_asset.staged_path);
+    if staged_path.exists() {
+        if !staged_path.starts_with(&state.staging_dir) {
+            return Ok(JobOutcome::Failed {
+                failure_reason: "refusing to delete user-owned source file".to_string(),
+            });
+        }
+        if let Err(err) = std::fs::remove_file(staged_path) {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            });
+        }
+    }
+
+    let _ = sqlx::query(
+        r#"
+        update media_assets
+        set extraction_status = 'cleaned',
+            extraction_progress = 'cleaned',
+            extraction_tmp_path = null,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(media_asset_id)
+    .execute(state.database.pool())
+    .await?;
+
+    Ok(JobOutcome::Completed)
 }
 
 async fn validate_normalized_audio(
