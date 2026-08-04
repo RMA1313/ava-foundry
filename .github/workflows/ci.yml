@@ -21,6 +21,8 @@ jobs:
       - name: Detect changed files
         id: filter
         shell: bash
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
@@ -29,10 +31,18 @@ jobs:
             git fetch --no-tags --prune --depth=1 origin "${GITHUB_BASE_REF}"
             diff_range="${base_ref}...${GITHUB_SHA}"
           else
-            diff_range="${GITHUB_EVENT_BEFORE}...${GITHUB_SHA}"
+            if [[ -z "${EVENT_BEFORE:-}" || "${EVENT_BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
+              diff_range=""
+            else
+              diff_range="${EVENT_BEFORE}...${GITHUB_SHA}"
+            fi
           fi
 
-          changed_files="$(git diff --name-only "${diff_range}")"
+          if [[ -n "${diff_range}" ]]; then
+            changed_files="$(git diff --name-only "${diff_range}")"
+          else
+            changed_files="$(git diff-tree --no-commit-id --name-only -r "${GITHUB_SHA}")"
+          fi
 
           rust=false
           python=false
