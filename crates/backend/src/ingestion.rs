@@ -116,21 +116,8 @@ pub async fn register_public_url(
     project_id: uuid::Uuid,
     url: &str,
 ) -> Result<RegistrationResult> {
-    let normalized_identity = format!("url:{}", {
-        let trimmed = url.trim();
-        if let Some(rest) = trimmed.strip_prefix("https://youtu.be/") {
-            format!("youtube:{}", rest.trim_matches('/'))
-        } else if let Some(rest) = trimmed.strip_prefix("https://www.youtube.com/watch?v=") {
-            format!("youtube:{}", rest.split('&').next().unwrap_or(rest))
-        } else {
-            let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-            let without_query = without_fragment
-                .split('?')
-                .next()
-                .unwrap_or(without_fragment);
-            without_query.trim_end_matches('/').to_lowercase()
-        }
-    });
+    validate_public_url(url)?;
+    let normalized_identity = format!("url:{}", { normalize_public_url(url) });
     if let Some(source) = database
         .sources()
         .get_by_identity(project_id, &normalized_identity)
@@ -242,6 +229,10 @@ pub async fn import_csv_urls(
             .filter(|value| !value.is_empty())
         {
             Some(url) => {
+                if validate_public_url(url).is_err() {
+                    summary.invalid += 1;
+                    continue;
+                }
                 let normalized_identity = format!("url:{}", normalize_public_url(url));
                 let existed = database
                     .sources()
@@ -258,6 +249,15 @@ pub async fn import_csv_urls(
         }
     }
     Ok(summary)
+}
+
+fn validate_public_url(url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(anyhow!("url must start with http:// or https://"))
+    }
 }
 
 pub fn validate_regular_file(path: &Path) -> Result<()> {

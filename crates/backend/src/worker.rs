@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,6 +14,8 @@ use chrono::{Duration, Utc};
 use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
+    download::DownloadCommandAdapter,
+    ingestion,
     job::{Job, JobType},
     server::AppState,
 };
@@ -169,10 +172,17 @@ impl WorkerRuntime {
         handlers: Arc<HashMap<JobType, Arc<dyn JobHandler>>>,
         job: Job,
     ) -> Result<()> {
-        let handler = handlers
-            .get(&job.job_type)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown job type: {:?}", job.job_type))?;
+        let handler = match handlers.get(&job.job_type).cloned() {
+            Some(handler) => handler,
+            None => {
+                let _ = state
+                    .database
+                    .jobs()
+                    .fail(job.id, &format!("unknown job type: {:?}", job.job_type))
+                    .await?;
+                return Ok(());
+            }
+        };
         let outcome = handler.handle(job.clone(), state.clone()).await?;
         match outcome {
             JobOutcome::Completed => {
@@ -196,6 +206,93 @@ impl WorkerRuntime {
     }
 }
 
+pub fn media_ingestion_handler(
+    staging_dir: impl Into<PathBuf>,
+    download_adapter: DownloadCommandAdapter,
+) -> impl JobHandler {
+    let staging_dir = staging_dir.into();
+    move |job: Job, state: AppState| {
+        let staging_dir = staging_dir.clone();
+        let download_adapter = download_adapter.clone();
+        async move { handle_media_ingestion_job(&state, job, &staging_dir, &download_adapter).await }
+    }
+}
+
+async fn handle_media_ingestion_job(
+    state: &AppState,
+    job: Job,
+    staging_dir: &Path,
+    download_adapter: &DownloadCommandAdapter,
+) -> Result<JobOutcome> {
+    let source_id = job
+        .source_id
+        .ok_or_else(|| anyhow!("media ingestion job requires a source"))?;
+    let source = state
+        .database
+        .sources()
+        .get(source_id)
+        .await?
+        .ok_or_else(|| anyhow!("source not found"))?;
+    match source.source_type {
+        crate::source::SourceType::LocalFile => {
+            let source_path = source
+                .original_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("local file source missing path"))?;
+            let _staged_path_bytes = ingestion::import_local_file_to_staging(
+                &state.database,
+                source_id,
+                Path::new(source_path),
+                staging_dir,
+            )
+            .await?;
+            Ok(JobOutcome::Completed)
+        }
+        crate::source::SourceType::PublicUrl => {
+            let url = source
+                .original_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("public url source missing url"))?;
+            let _staged = download_url_to_staging(
+                &state.database,
+                source_id,
+                url,
+                staging_dir,
+                download_adapter,
+            )
+            .await?;
+            Ok(JobOutcome::Completed)
+        }
+        other => Ok(JobOutcome::Failed {
+            failure_reason: format!("unsupported source type: {:?}", other),
+        }),
+    }
+}
+
+async fn download_url_to_staging(
+    _database: &crate::db::Database,
+    source_id: uuid::Uuid,
+    url: &str,
+    staging_dir: &Path,
+    adapter: &DownloadCommandAdapter,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(staging_dir).await?;
+    let final_path = staging_dir.join(format!("{}.bin", source_id));
+    if final_path.exists() {
+        return Ok(final_path);
+    }
+    let tmp_path = staging_dir.join(format!("{}.part", source_id));
+    let mut process = adapter.start(url, &tmp_path).await?;
+    while let Some(_line) = process.next_progress().await {}
+    let status = process.wait().await?;
+    if !status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(anyhow!("download process failed"));
+    }
+    tokio::fs::rename(&tmp_path, &final_path).await?;
+    Ok(final_path)
+}
+
 pub fn generate_worker_id() -> String {
     format!("worker-{}", Uuid::new_v4().simple())
 }
@@ -204,4 +301,171 @@ use uuid::Uuid;
 
 pub fn default_worker_runtime() -> WorkerRuntime {
     WorkerRuntime::new(generate_worker_id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::Database,
+        job::{JobRepository, JobStatus},
+        migrations,
+    };
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use std::env;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    async fn test_pool() -> PgPool {
+        let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
+            .or_else(|_| env::var("DATA_STUDIO_DATABASE_URL"))
+            .unwrap_or_else(|_| {
+                "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+            });
+        let schema_name = format!("worker_test_{}", Uuid::new_v4().simple());
+        let admin_pool = PgPool::connect(&database_url)
+            .await
+            .expect("failed to connect to test database");
+        sqlx::query(&format!("create schema {}", schema_name))
+            .execute(&admin_pool)
+            .await
+            .expect("failed to create test schema");
+        let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
+        migrations::run(&schema_database_url)
+            .await
+            .expect("failed to run migrations");
+        PgPool::connect(&schema_database_url)
+            .await
+            .expect("failed to connect to schema-scoped test database")
+    }
+
+    async fn seed_project(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into projects (id, name, description, created_at, updated_at)
+            values ($1, $2, $3, now(), now())
+            "#,
+        )
+        .bind(id)
+        .bind("Research")
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("project should insert");
+        id
+    }
+
+    #[tokio::test]
+    async fn unknown_job_types_fail_deterministically() {
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool);
+        let source_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, now(), now())
+            "#,
+        )
+        .bind(source_id)
+        .bind(project_id)
+        .bind("public_url")
+        .bind(Some("https://example.com/video"))
+        .bind("url:https://example.com/video")
+        .bind(Option::<String>::None)
+        .execute(database.pool())
+        .await
+        .expect("source should insert");
+        let _created = JobRepository::new(database.pool().clone())
+            .create(
+                project_id,
+                Some(source_id),
+                JobType::AudioExtraction,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should create");
+        let job = JobRepository::new(database.pool().clone())
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("claim should succeed")
+            .expect("job should be claimable");
+        let runtime = WorkerRuntime::new("worker-test".to_string());
+        let outcome = runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                },
+                Arc::new(HashMap::new()),
+                job.clone(),
+            )
+            .await;
+        assert!(outcome.is_ok());
+        let fetched = database.jobs().get(job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.status, JobStatus::Failed);
+        assert!(fetched
+            .failure_reason
+            .as_deref()
+            .unwrap()
+            .contains("unknown job type"));
+    }
+
+    #[tokio::test]
+    async fn dispatches_fake_handlers() {
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool);
+        let source_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, now(), now())
+            "#,
+        )
+        .bind(source_id)
+        .bind(project_id)
+        .bind("public_url")
+        .bind(Some("https://example.com/video"))
+        .bind("url:https://example.com/video")
+        .bind(Option::<String>::None)
+        .execute(database.pool())
+        .await
+        .expect("source should insert");
+        let _created = JobRepository::new(database.pool().clone())
+            .create(
+                project_id,
+                Some(source_id),
+                JobType::AudioExtraction,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should create");
+        let job = JobRepository::new(database.pool().clone())
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("claim should succeed")
+            .expect("job should be claimable");
+        let calls = Arc::new(Mutex::new(0usize));
+        let handler_calls = calls.clone();
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::AudioExtraction,
+            move |_job, _state| {
+                let handler_calls = handler_calls.clone();
+                async move {
+                    *handler_calls.lock().await += 1;
+                    Ok(JobOutcome::Completed)
+                }
+            },
+        );
+        let handlers = runtime.handlers.clone();
+        runtime
+            .execute_job(AppState { database }, handlers, job.clone())
+            .await
+            .expect("dispatch should succeed");
+        assert_eq!(*calls.lock().await, 1);
+    }
 }
