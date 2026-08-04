@@ -21,6 +21,8 @@ export type Source = {
   ingestion_status: string;
   progress: string;
   failure_summary?: string | null;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type DatasetImportSummary = {
@@ -40,6 +42,9 @@ export type Job = {
   attempts: number;
   progress: string;
   failure_summary?: string | null;
+  priority?: number;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type AudioAsset = {
@@ -59,6 +64,32 @@ export type AudioAsset = {
   channels: number;
   byte_size: number;
   storage_path: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type MediaAsset = {
+  id: string;
+  project_id: string;
+  source_id: string;
+  media_kind: string;
+  staged_path: string;
+  original_filename?: string | null;
+  byte_size: number;
+  ingestion_status: string;
+  inspection_status?: string | null;
+  extraction_status?: string | null;
+  extraction_progress?: string | null;
+  extraction_tmp_path?: string | null;
+  extracted_at?: string | null;
+  container_format?: string | null;
+  duration_seconds?: number | null;
+  codecs?: string | null;
+  sample_rate_hz?: number | null;
+  channels?: number | null;
+  inspected_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type StageRun = {
@@ -161,6 +192,11 @@ export async function fetchProjectSources(baseUrl: string, projectId: string): P
 
 export async function fetchProjectJobs(baseUrl: string, projectId: string): Promise<Job[]> {
   const body = await requestJson<{ items: Job[] }>(`${baseUrl}/projects/${projectId}/jobs`);
+  return body.items;
+}
+
+export async function fetchProjectMediaAssets(baseUrl: string, projectId: string): Promise<MediaAsset[]> {
+  const body = await requestJson<{ items: MediaAsset[] }>(`${baseUrl}/projects/${projectId}/media-assets`);
   return body.items;
 }
 

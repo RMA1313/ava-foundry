@@ -50,6 +50,22 @@ pub struct MediaAssetUpsert {
     pub inspected_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaAssetListFilter {
+    pub project_id: Uuid,
+    pub ingestion_status: Option<String>,
+    pub inspection_status: Option<String>,
+    pub extraction_status: Option<String>,
+    pub media_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaAssetPage {
+    pub items: Vec<MediaAsset>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct MediaAssetRepository {
     pool: PgPool,
@@ -168,6 +184,52 @@ impl MediaAssetRepository {
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(media_asset_from_row).transpose()
+    }
+
+    pub async fn list_paginated(
+        &self,
+        filter: MediaAssetListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<MediaAssetPage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let rows = sqlx::query(
+            r#"
+            select id, project_id, source_id, media_kind, staged_path,
+                   original_filename, byte_size, ingestion_status,
+                   inspection_status, extraction_status, extraction_progress,
+                   extraction_tmp_path, extracted_at, container_format,
+                   duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
+                   created_at, updated_at
+            from media_assets
+            where project_id = $1
+              and ($2::text is null or ingestion_status = $2)
+              and ($3::text is null or inspection_status = $3)
+              and ($4::text is null or extraction_status = $4)
+              and ($5::text is null or media_kind = $5)
+            order by created_at asc, id asc
+            limit $6 offset $7
+            "#,
+        )
+        .bind(filter.project_id)
+        .bind(filter.ingestion_status.as_deref())
+        .bind(filter.inspection_status.as_deref())
+        .bind(filter.extraction_status.as_deref())
+        .bind(filter.media_kind.as_deref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let items = rows
+            .iter()
+            .map(media_asset_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(MediaAssetPage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+        })
     }
 }
 

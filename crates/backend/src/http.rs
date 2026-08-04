@@ -13,6 +13,7 @@ use crate::{
     duplicate::DuplicateGroupDetails,
     ingestion,
     job::{JobListFilter, JobStatus, JobType},
+    media_asset::{MediaAsset, MediaAssetListFilter},
     server::AppState,
     source::{SourceListFilter, SourceType},
     stage_run::StageRun,
@@ -75,6 +76,16 @@ struct JobListQuery {
     offset: Option<u32>,
     job_type: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MediaAssetListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+    ingestion_status: Option<String>,
+    inspection_status: Option<String>,
+    extraction_status: Option<String>,
+    media_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,8 +204,40 @@ struct AudioAssetResponse {
 }
 
 #[derive(Serialize)]
+struct MediaAssetResponse {
+    id: String,
+    project_id: String,
+    source_id: String,
+    media_kind: String,
+    staged_path: String,
+    original_filename: Option<String>,
+    byte_size: i64,
+    ingestion_status: String,
+    inspection_status: Option<String>,
+    extraction_status: Option<String>,
+    extraction_progress: Option<String>,
+    extraction_tmp_path: Option<String>,
+    extracted_at: Option<String>,
+    container_format: Option<String>,
+    duration_seconds: Option<f64>,
+    codecs: Option<String>,
+    sample_rate_hz: Option<i32>,
+    channels: Option<i32>,
+    inspected_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
 struct AudioAssetsResponse {
     items: Vec<AudioAssetResponse>,
+    limit: u32,
+    offset: u32,
+}
+
+#[derive(Serialize)]
+struct MediaAssetsResponse {
+    items: Vec<MediaAssetResponse>,
     limit: u32,
     offset: u32,
 }
@@ -333,6 +376,7 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id", get(get_project).put(update_project))
         .route("/projects/:id/sources", get(list_sources))
         .route("/projects/:id/jobs", get(list_jobs))
+        .route("/projects/:id/media-assets", get(list_media_assets))
         .route("/projects/:id/audio-assets", get(list_audio_assets))
         .route(
             "/projects/:id/audio-assets/:audio_asset_id",
@@ -562,6 +606,35 @@ async fn list_jobs(
         .map_err(database_error)?;
     Ok(Json(JobsResponse {
         items: page.items.into_iter().map(job_response).collect(),
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+async fn list_media_assets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<MediaAssetListQuery>,
+) -> Result<Json<MediaAssetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let page = state
+        .database
+        .media_assets()
+        .list_paginated(
+            MediaAssetListFilter {
+                project_id,
+                ingestion_status: query.ingestion_status.clone(),
+                inspection_status: query.inspection_status.clone(),
+                extraction_status: query.extraction_status.clone(),
+                media_kind: query.media_kind.clone(),
+            },
+            query.limit.unwrap_or(50) as i64,
+            query.offset.unwrap_or(0) as i64,
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(MediaAssetsResponse {
+        items: page.items.into_iter().map(media_asset_response).collect(),
         limit: page.limit,
         offset: page.offset,
     }))
@@ -942,11 +1015,9 @@ async fn upload_file(
 ) -> Result<Json<UploadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let project_id = parse_uuid(&id)?;
     let mut file_path: Option<PathBuf> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|err| {
+        error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+    })? {
         if field.name().unwrap_or_default() == "file" {
             let filename = field.file_name().unwrap_or(kind).to_string();
             let path = persist_upload(&state, project_id, filename, field)
@@ -1017,11 +1088,9 @@ async fn import_dataset(
     let mut file_path: Option<PathBuf> = None;
     let mut audio_path_field = String::from("audio_path");
     let mut selected_manifest_path: Option<PathBuf> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|err| {
+        error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+    })? {
         match field.name().unwrap_or_default() {
             "file" => {
                 let filename = field.file_name().unwrap_or("dataset");
@@ -1231,6 +1300,32 @@ fn job_response(job: crate::job::Job) -> JobResponse {
         failure_summary: bounded_summary(job.failure_reason.as_deref()),
         created_at: job.created_at.to_rfc3339(),
         updated_at: job.updated_at.to_rfc3339(),
+    }
+}
+
+fn media_asset_response(media_asset: MediaAsset) -> MediaAssetResponse {
+    MediaAssetResponse {
+        id: media_asset.id.to_string(),
+        project_id: media_asset.project_id.to_string(),
+        source_id: media_asset.source_id.to_string(),
+        media_kind: media_asset.media_kind,
+        staged_path: media_asset.staged_path,
+        original_filename: media_asset.original_filename,
+        byte_size: media_asset.byte_size,
+        ingestion_status: media_asset.ingestion_status,
+        inspection_status: media_asset.inspection_status,
+        extraction_status: media_asset.extraction_status,
+        extraction_progress: media_asset.extraction_progress,
+        extraction_tmp_path: media_asset.extraction_tmp_path,
+        extracted_at: media_asset.extracted_at.map(|value| value.to_rfc3339()),
+        container_format: media_asset.container_format,
+        duration_seconds: media_asset.duration_seconds,
+        codecs: media_asset.codecs,
+        sample_rate_hz: media_asset.sample_rate_hz,
+        channels: media_asset.channels,
+        inspected_at: media_asset.inspected_at.map(|value| value.to_rfc3339()),
+        created_at: media_asset.created_at.to_rfc3339(),
+        updated_at: media_asset.updated_at.to_rfc3339(),
     }
 }
 
