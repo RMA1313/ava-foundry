@@ -2,23 +2,15 @@
 # AGENTS.md
 
 ## Project
-
 Local-first Persian Audio Dataset Builder.
-
 The system collects, processes, categorizes, and exports large-scale Persian audio datasets.
-
 Read the documentation under `docs/` before implementing new functionality.
-
----
 
 # Architecture
 
 The architecture defined in `docs/` is the source of truth.
-
 Do not introduce architectural changes unless explicitly requested.
-
 Current architecture:
-
 - Rust orchestrates the pipeline.
 - PostgreSQL is the only database.
 - PostgreSQL is the durable job queue.
@@ -28,7 +20,6 @@ Current architecture:
 - Audio is the permanent asset.
 - Processing is asynchronous and pipeline-based.
 
----
 
 # Engineering Principles
 
@@ -200,18 +191,6 @@ Avoid:
 - hidden side effects
 - global mutable state
 - premature optimization
-
----
-
-# Commits
-
-Do not create commits.
-
-Do not modify Git history.
-
-Do not create branches.
-
----
 
 # Task Completion
 
