@@ -121,3 +121,73 @@ async fn repository_round_trip_and_idempotency_work() {
     assert_eq!(fetched.id, first.id);
     assert_eq!(fetched.staged_path, "/tmp/staged/source.bin");
 }
+
+#[tokio::test]
+async fn migration_creates_media_assets_table_with_source_link_and_unique_constraint() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let (project_id, source_id) = seed_project_and_source(&pool).await;
+
+    sqlx::query(
+        r#"
+        insert into media_assets (
+            id, project_id, source_id, media_kind, staged_path,
+            original_filename, byte_size, ingestion_status, created_at, updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(source_id)
+    .bind("audio")
+    .bind("/tmp/staged/source.wav")
+    .bind(Some("source.wav"))
+    .bind(42_i64)
+    .bind("ready")
+    .execute(&pool)
+    .await
+    .expect("media asset should insert through migration schema");
+
+    let duplicate = sqlx::query(
+        r#"
+        insert into media_assets (
+            id, project_id, source_id, media_kind, staged_path,
+            original_filename, byte_size, ingestion_status, created_at, updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(source_id)
+    .bind("audio")
+    .bind("/tmp/staged/source-duplicate.wav")
+    .bind(Some("source.wav"))
+    .bind(99_i64)
+    .bind("ready")
+    .execute(&pool)
+    .await;
+    assert!(duplicate.is_err());
+
+    let orphan = sqlx::query(
+        r#"
+        insert into media_assets (
+            id, project_id, source_id, media_kind, staged_path,
+            original_filename, byte_size, ingestion_status, created_at, updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind(Uuid::new_v4())
+    .bind("audio")
+    .bind("/tmp/staged/orphan.wav")
+    .bind(Option::<String>::None)
+    .bind(5_i64)
+    .bind("ready")
+    .execute(&pool)
+    .await;
+    assert!(orphan.is_err());
+}

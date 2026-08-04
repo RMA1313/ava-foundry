@@ -293,7 +293,7 @@ async fn handle_media_ingestion_job(
     }
 }
 
-async fn finalize_media_ingestion(
+pub async fn finalize_media_ingestion(
     database: &crate::db::Database,
     job_id: uuid::Uuid,
     source_id: uuid::Uuid,
@@ -308,7 +308,7 @@ async fn finalize_media_ingestion(
         .get(source_id)
         .await?
         .ok_or_else(|| anyhow!("source not found"))?;
-    sqlx::query(
+    let source_update = sqlx::query(
         r#"
         update sources
         set ingestion_status = 'completed',
@@ -319,6 +319,9 @@ async fn finalize_media_ingestion(
     .bind(source_id)
     .execute(&mut *tx)
     .await?;
+    if source_update.rows_affected() != 1 {
+        return Err(anyhow!("source not found"));
+    }
     database
         .media_assets()
         .upsert_ingested(
@@ -334,7 +337,7 @@ async fn finalize_media_ingestion(
             },
         )
         .await?;
-    sqlx::query(
+    let job_update = sqlx::query(
         r#"
         update jobs
         set status = 'completed',
@@ -345,6 +348,9 @@ async fn finalize_media_ingestion(
     .bind(job_id)
     .execute(&mut *tx)
     .await?;
+    if job_update.rows_affected() != 1 {
+        return Err(anyhow!("job not found"));
+    }
     tx.commit().await?;
     Ok(())
 }

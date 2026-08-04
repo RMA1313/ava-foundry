@@ -255,3 +255,46 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0].source_id, source.id);
 }
+
+#[tokio::test]
+async fn transaction_rolls_back_when_finalization_job_is_missing() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool).await;
+    let database = Database::from_pool(pool.clone());
+    let source = database
+        .sources()
+        .create(
+            project_id,
+            SourceType::PublicUrl,
+            Some("https://youtu.be/abcd1234"),
+            None,
+        )
+        .await
+        .expect("source should be created");
+    let temp_dir = TempDir::new().expect("temp dir");
+    let staged_path = temp_dir.path().join(format!("{}.bin", source.id));
+    fs::write(&staged_path, b"downloaded").expect("staged file");
+
+    let err = backend::worker::finalize_media_ingestion(
+        &database,
+        Uuid::new_v4(),
+        source.id,
+        "video",
+        staged_path.as_path(),
+        10,
+        source.original_url.as_deref(),
+    )
+    .await
+    .expect_err("finalization should fail for missing job");
+    assert!(err.to_string().contains("job not found"));
+
+    let source = database.sources().get(source.id).await.unwrap().unwrap();
+    assert_eq!(source.ingestion_status, "pending");
+    assert!(database
+        .media_assets()
+        .get_by_source(source.id)
+        .await
+        .unwrap()
+        .is_none());
+}
