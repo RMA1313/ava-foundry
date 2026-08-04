@@ -26,17 +26,20 @@ impl ProjectRepository {
         let name = validate_name(name)?;
         let description = description.map(normalize_description);
         let id = Uuid::new_v4();
+        let now = Utc::now();
 
         let row = sqlx::query(
             r#"
-            insert into projects (id, name, description)
-            values ($1, $2, $3)
+            insert into projects (id, name, description, created_at, updated_at)
+            values ($1, $2, $3, $4, $5)
             returning id, name, description, created_at, updated_at
             "#,
         )
         .bind(id)
         .bind(&name)
         .bind(description.as_deref())
+        .bind(now)
+        .bind(now)
         .fetch_one(&self.pool)
         .await?;
 
