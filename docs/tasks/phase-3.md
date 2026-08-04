@@ -21,6 +21,12 @@ Identify duplicate audio assets, group equivalent recordings, and ensure that do
 
 Persist fingerprints and their processing state.
 
+### Acceptance Criteria
+
+- Each Audio Fingerprint belongs to exactly one Audio Asset.
+- Fingerprint algorithm, version, status, duration, storage path, and timestamps are persisted.
+- Duplicate fingerprints for the same Audio Asset, algorithm, and version are rejected.
+
 ---
 
 ## P3-02 — Fingerprint Storage
@@ -28,6 +34,12 @@ Persist fingerprints and their processing state.
 ### Goal
 
 Store fingerprint files and metadata.
+
+### Acceptance Criteria
+
+- Fingerprint storage paths are deterministic and local.
+- Storage paths remain within the configured audio roots.
+- Fingerprint finalization is atomic.
 
 ---
 

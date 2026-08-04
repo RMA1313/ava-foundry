@@ -5,6 +5,7 @@ static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 pub async fn run(database_url: &str) -> Result<()> {
     // Keep this module changing when migrations change so SQLx re-embeds the set.
+    // Phase 3 adds fingerprint persistence in a later migration.
     let _ = database_url;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect(database_url)

@@ -2,6 +2,7 @@ use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 use crate::audio_asset::AudioAssetRepository;
+use crate::audio_fingerprint::AudioFingerprintRepository;
 use crate::job::JobRepository;
 use crate::media_asset::MediaAssetRepository;
 use crate::project::ProjectRepository;
@@ -48,6 +49,10 @@ impl Database {
 
     pub fn audio_assets(&self) -> AudioAssetRepository {
         AudioAssetRepository::new(self.pool.clone())
+    }
+
+    pub fn audio_fingerprints(&self) -> AudioFingerprintRepository {
+        AudioFingerprintRepository::new(self.pool.clone())
     }
 
     pub fn stage_runs(&self) -> StageRunRepository {

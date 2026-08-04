@@ -1,4 +1,5 @@
 pub mod audio_asset;
+pub mod audio_fingerprint;
 pub mod config;
 pub mod db;
 pub mod download;
