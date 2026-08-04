@@ -72,6 +72,11 @@ struct JobListQuery {
     status: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RetryRequest {
+    available_at: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ProjectResponse {
     id: String,
@@ -179,6 +184,7 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id", get(get_project).put(update_project))
         .route("/projects/:id/sources", get(list_sources))
         .route("/projects/:id/jobs", get(list_jobs))
+        .route("/projects/:project_id/jobs/:job_id/retry", post(retry_job))
         .route(
             "/projects/:id/sources/local-file",
             post(register_local_file),
@@ -386,6 +392,42 @@ async fn list_jobs(
     }))
 }
 
+async fn retry_job(
+    State(state): State<AppState>,
+    Path((project_id, job_id)): Path<(String, String)>,
+    Json(payload): Json<RetryRequest>,
+) -> Result<Json<JobResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let job_id = parse_uuid(&job_id)?;
+    let job = state
+        .database
+        .jobs()
+        .get(job_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job_not_found", "job not found"))?;
+    if job.project_id != project_id {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            "job not found",
+        ));
+    }
+    let available_at = payload
+        .available_at
+        .as_deref()
+        .and_then(parse_rfc3339)
+        .unwrap_or_else(chrono::Utc::now);
+    let retried = state
+        .database
+        .jobs()
+        .schedule_retry(job_id, "manual retry", available_at, 3)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "job_not_found", "job not found"))?;
+    Ok(Json(job_response(retried)))
+}
+
 async fn scan_folder(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -447,6 +489,12 @@ fn parse_uuid(value: &str) -> Result<uuid::Uuid, (StatusCode, Json<ErrorResponse
             "project id must be a valid uuid",
         )
     })
+}
+
+fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&chrono::Utc))
 }
 
 fn parse_source_type(value: &str) -> Result<SourceType, (StatusCode, Json<ErrorResponse>)> {

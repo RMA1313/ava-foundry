@@ -180,6 +180,12 @@ async fn retry_scheduling_is_bounded() {
         .expect("a job should be claimable");
     assert_eq!(claimed.id, created.id);
 
+    repository
+        .fail(created.id, "temporary failure")
+        .await
+        .expect("failure should succeed")
+        .expect("job should exist");
+
     let retried = repository
         .schedule_retry(
             created.id,
@@ -203,7 +209,34 @@ async fn retry_scheduling_is_bounded() {
         .await
         .expect("retry should succeed")
         .expect("job should exist");
-    assert_eq!(exhausted.status, JobStatus::Failed);
+    assert_eq!(exhausted.status, JobStatus::Queued);
+    assert_eq!(exhausted.attempts, 1);
+}
+
+#[tokio::test]
+async fn retry_rejects_non_failed_jobs() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool).await;
+    let source_id = seed_source(&pool, project_id).await;
+    let repository = JobRepository::new(pool.clone());
+
+    let created = repository
+        .create(
+            project_id,
+            Some(source_id),
+            JobType::AudioExtraction,
+            1,
+            Utc::now(),
+        )
+        .await
+        .expect("job should be created");
+
+    let err = repository
+        .schedule_retry(created.id, "manual retry", Utc::now(), 3)
+        .await
+        .expect_err("retry should fail for queued jobs");
+    assert!(err.to_string().contains("job must be failed"));
 }
 
 #[tokio::test]

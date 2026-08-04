@@ -6,5 +6,9 @@ describe("fetchLiveness", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 })));
     await expect(fetchLiveness("http://localhost:8080")).resolves.toBe(true);
   });
-});
 
+  it("returns false when backend is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 503 })));
+    await expect(fetchLiveness("http://localhost:8080")).resolves.toBe(false);
+  });
+});

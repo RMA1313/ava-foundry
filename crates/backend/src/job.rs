@@ -331,9 +331,17 @@ impl JobRepository {
             return Ok(None);
         };
         let job = job_from_row(&current)?;
-        if job.status == JobStatus::Completed || job.status == JobStatus::Cancelled {
+        if job.status == JobStatus::Queued
+            && job.attempts > 0
+            && job.worker_id.is_none()
+            && job.lease_expires_at.is_none()
+        {
             tx.commit().await?;
             return Ok(Some(job));
+        }
+        if job.status != JobStatus::Failed {
+            tx.commit().await?;
+            return Err(anyhow!("job must be failed"));
         }
         if job.attempts + 1 >= max_attempts {
             let row = sqlx::query(

@@ -217,3 +217,132 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
     assert_eq!(paged["items"].as_array().unwrap().len(), 1);
     assert_eq!(paged["items"][0]["id"], source_b.id.to_string());
 }
+
+#[tokio::test]
+async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool, "Research").await;
+    let other_project_id = seed_project(&pool, "Other").await;
+    let database = Database::from_pool(pool.clone());
+
+    let source = database
+        .sources()
+        .create(
+            project_id,
+            SourceType::PublicUrl,
+            Some("https://youtu.be/abcd1234"),
+            None,
+        )
+        .await
+        .unwrap();
+    let job = database
+        .jobs()
+        .create(
+            project_id,
+            Some(source.id),
+            JobType::AudioExtraction,
+            1,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        update jobs
+        set status = 'failed',
+            attempts = 1,
+            failure_reason = 'temporary failure',
+            lease_expires_at = now(),
+            worker_id = 'worker-1',
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let other_source = database
+        .sources()
+        .create(
+            other_project_id,
+            SourceType::PublicUrl,
+            Some("https://youtu.be/zzzz9999"),
+            None,
+        )
+        .await
+        .unwrap();
+    let other_job = database
+        .jobs()
+        .create(
+            other_project_id,
+            Some(other_source.id),
+            JobType::AudioExtraction,
+            1,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        update jobs
+        set status = 'failed',
+            attempts = 1,
+            failure_reason = 'temporary failure'
+        where id = $1
+        "#,
+    )
+    .bind(other_job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = backend::http::router(AppState { database });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/projects/{project_id}/jobs/{}/retry", job.id))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"available_at":"2026-08-04T00:00:00Z"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let retried: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(retried["status"], "queued");
+    assert_eq!(retried["lease_expires_at"], Value::Null);
+    assert_eq!(retried["worker_id"], Value::Null);
+
+    let repeated = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/projects/{project_id}/jobs/{}/retry", job.id))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), StatusCode::OK);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/projects/{other_project_id}/jobs/{}/retry",
+                job.id
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+}
