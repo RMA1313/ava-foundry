@@ -185,6 +185,17 @@ export async function fetchProjects(baseUrl: string): Promise<Project[]> {
   return body.items;
 }
 
+export async function fetchProject(baseUrl: string, projectId: string): Promise<Project> {
+  return requestJson<Project>(`${baseUrl}/projects/${projectId}`);
+}
+
+export async function updateProject(baseUrl: string, projectId: string, name: string, description: string | null) {
+  return requestJson<Project>(`${baseUrl}/projects/${projectId}`, {
+    method: "PUT",
+    body: JSON.stringify({ name, description }),
+  });
+}
+
 export async function fetchProjectSources(baseUrl: string, projectId: string): Promise<Source[]> {
   const body = await requestJson<{ items: Source[] }>(`${baseUrl}/projects/${projectId}/sources`);
   return body.items;

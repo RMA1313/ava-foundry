@@ -5,8 +5,18 @@ import { App } from "./app";
 const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input);
   if (url.endsWith("/health/live")) return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
-  if (url.endsWith("/projects")) return new Response(JSON.stringify({ items: [{ id: "project-1", name: "پژوهش", description: null }] }), { status: 200 });
-  if (url.includes("/sources")) return new Response(JSON.stringify({ items: [{ id: "source-1", project_id: "project-1", source_type: "public_url", original_url: "https://example.com", ingestion_status: "staged", progress: "staged", failure_summary: null }] }), { status: 200 });
+  if (url.endsWith("/projects")) return new Response(JSON.stringify({ items: [{ id: "project-1", name: "پژوهش", description: "collection" }] }), { status: 200 });
+  if (url.endsWith("/projects/project-1")) return new Response(JSON.stringify({ id: "project-1", name: "پژوهش", description: "collection" }), { status: 200 });
+  if (url.includes("/projects/project-1") && init?.method === "PUT") {
+    const body = JSON.parse(String(init.body ?? "{}")) as { name?: string; description?: string | null };
+    return new Response(JSON.stringify({ id: "project-1", name: body.name, description: body.description }), { status: 200 });
+  }
+  if (url.includes("/sources/url") && init?.method === "POST") {
+    return new Response(JSON.stringify({ source_id: "source-1", job_id: "job-1" }), { status: 200 });
+  }
+  if (url.includes("/datasets/import") && init?.method === "POST") {
+    return new Response(JSON.stringify({ imported: 2, duplicate: 1, invalid: 0, failed: 0, row_failures: [] }), { status: 200 });
+  }
   if (url.includes("/jobs/job-1/retry")) return new Response(JSON.stringify({ id: "job-1", project_id: "project-1", source_id: "source-1", job_type: "media_ingestion", status: "queued", attempts: 2, progress: "queued", failure_summary: null }), { status: 200 });
   if (url.includes("/jobs/recover")) return new Response(JSON.stringify({ recovered: 1 }), { status: 200 });
   if (url.includes("/jobs")) return new Response(JSON.stringify({ items: [{ id: "job-1", project_id: "project-1", source_id: "source-1", job_type: "media_ingestion", status: "failed", attempts: 1, progress: "failed", failure_summary: "duplicate" }] }), { status: 200 });
@@ -17,10 +27,7 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
   if (url.includes("/metrics/summary")) return new Response(JSON.stringify({ stage_runs: [{ id: "stage-1", project_id: "project-1", stage_name: "duplicate_detection", status: "completed", queue_wait_ms: 10, wall_time_ms: 20, input_bytes: 100, output_bytes: 200, input_duration_seconds: 12.5, throughput: 0.625, failure_reason: null, cpu_percent: null, memory_bytes: null }], deduplication: { throughput: 0.625, candidate_count: 1, match_rate: 1, duplicate_ratio: 0.25, unique_duration_seconds: 12.5, processing_failures: 0 } }), { status: 200 });
   if (url.includes("/pipeline/pause")) return new Response(JSON.stringify({ paused: true }), { status: 200 });
   if (url.includes("/pipeline/resume")) return new Response(JSON.stringify({ paused: false }), { status: 200 });
-  if (url.includes("/sources/url") && init?.method === "POST") {
-    const body = JSON.parse(String(init.body ?? "{}")) as { url?: string };
-    if (body.url === "https://example.com") return new Response(JSON.stringify({ source_id: "source-1", job_id: "job-1" }), { status: 200 });
-  }
+  if (url.includes("/sources")) return new Response(JSON.stringify({ items: [{ id: "source-1", project_id: "project-1", source_type: "public_url", original_url: "https://example.com", ingestion_status: "staged", progress: "staged", failure_summary: null }] }), { status: 200 });
   return new Response(JSON.stringify({}), { status: 200 });
 });
 
@@ -34,31 +41,49 @@ describe("App", () => {
     expect(screen.getByText("تکراری‌ها")).toBeInTheDocument();
     expect(screen.getByText("آمار پروژه")).toBeInTheDocument();
     expect(screen.getByText("کنترل پایپلاین")).toBeInTheDocument();
+    expect(screen.getByText("تنظیمات")).toBeInTheDocument();
   });
 
-  it("persists search and filters in the url", async () => {
+  it("keeps search and filters in the url", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getAllByRole("heading", { name: "منابع" }).length).toBeGreaterThan(0));
     fireEvent.change(screen.getAllByPlaceholderText("جستجو...")[0], { target: { value: "example" } });
     expect(window.location.search).toContain("q=example");
   });
 
-  it("shows duplicate groups and pipeline actions", async () => {
+  it("supports url import, dataset import, and job recovery", async () => {
+    render(<App />);
+    fireEvent.click(screen.getAllByRole("link", { name: "درون‌ریزی URL" })[0]);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "درون‌ریزی URL" })).toBeInTheDocument());
+    fireEvent.change(screen.getByPlaceholderText("https://..."), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "ثبت URL" }));
+    await waitFor(() => expect(screen.getByText(/source source-1/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getAllByRole("link", { name: "درون‌ریزی دیتاست" })[0]);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "درون‌ریزی دیتاست" })).toBeInTheDocument());
+    const file = new File(["id,audio_path\n1,/tmp/audio.flac"], "dataset.csv", { type: "text/csv" });
+    fireEvent.change(screen.getByLabelText("فایل ورودی"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "درون‌ریزی" }));
+    await waitFor(() => expect(screen.getByText(/"imported": 2/)).toBeInTheDocument());
+  });
+
+  it("shows duplicate groups, pipeline actions, and settings save feedback", async () => {
     render(<App />);
     fireEvent.click(screen.getAllByRole("link", { name: "تکراری‌ها" })[0]);
     await waitFor(() => expect(screen.getByRole("heading", { name: "تکراری‌ها" })).toBeInTheDocument());
     expect(screen.getByText(/canonical: audio-1/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "بازیابی canonical" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/duplicates/recover"), expect.any(Object)));
-  });
 
-  it("shows project statistics and pipeline controls", async () => {
-    render(<App />);
-    fireEvent.click(screen.getAllByRole("link", { name: "آمار پروژه" })[0]);
-    await waitFor(() => expect(screen.getByRole("heading", { name: "آمار پروژه" })).toBeInTheDocument());
-    expect(screen.getAllByText("1", { selector: "div" }).length).toBeGreaterThan(0);
     fireEvent.click(screen.getAllByRole("link", { name: "کنترل پایپلاین" })[0]);
     await waitFor(() => expect(screen.getByRole("heading", { name: "کنترل پایپلاین" })).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "توقف" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("link", { name: "تنظیمات" })[0]);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "تنظیمات" })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("نام پروژه"), { target: { value: "پژوهش تازه" } });
+    fireEvent.change(screen.getByLabelText("توضیح"), { target: { value: "ویرایش شده" } });
+    fireEvent.click(screen.getByRole("button", { name: "ذخیره تنظیمات" }));
+    await waitFor(() => expect(screen.getByText("تنظیمات پروژه ذخیره شد.")).toBeInTheDocument());
   });
 });
