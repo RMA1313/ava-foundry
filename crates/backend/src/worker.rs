@@ -186,7 +186,9 @@ impl WorkerRuntime {
         let outcome = handler.handle(job.clone(), state.clone()).await?;
         match outcome {
             JobOutcome::Completed => {
-                let _ = state.database.jobs().complete(job.id).await?;
+                if job.job_type != JobType::MediaIngestion {
+                    let _ = state.database.jobs().complete(job.id).await?;
+                }
             }
             JobOutcome::Failed { failure_reason } => {
                 let _ = state.database.jobs().fail(job.id, &failure_reason).await?;
@@ -239,11 +241,21 @@ async fn handle_media_ingestion_job(
                 .original_url
                 .as_deref()
                 .ok_or_else(|| anyhow!("local file source missing path"))?;
-            let _staged_path_bytes = ingestion::import_local_file_to_staging(
+            let (staged_path, byte_size) = ingestion::import_local_file_to_staging(
                 &state.database,
                 source_id,
                 Path::new(source_path),
                 staging_dir,
+            )
+            .await?;
+            finalize_media_ingestion(
+                &state.database,
+                job.id,
+                source_id,
+                "file",
+                staged_path.as_path(),
+                byte_size as i64,
+                source.original_url.as_deref(),
             )
             .await?;
             Ok(JobOutcome::Completed)
@@ -261,12 +273,80 @@ async fn handle_media_ingestion_job(
                 download_adapter,
             )
             .await?;
+            let staged_path = staging_dir.join(format!("{}.bin", source_id));
+            let byte_size = staged_path.metadata()?.len();
+            finalize_media_ingestion(
+                &state.database,
+                job.id,
+                source_id,
+                "video",
+                staged_path.as_path(),
+                byte_size as i64,
+                source.original_url.as_deref(),
+            )
+            .await?;
             Ok(JobOutcome::Completed)
         }
         other => Ok(JobOutcome::Failed {
             failure_reason: format!("unsupported source type: {:?}", other),
         }),
     }
+}
+
+async fn finalize_media_ingestion(
+    database: &crate::db::Database,
+    job_id: uuid::Uuid,
+    source_id: uuid::Uuid,
+    media_kind: &str,
+    staged_path: &Path,
+    byte_size: i64,
+    original_filename: Option<&str>,
+) -> Result<()> {
+    let mut tx = database.pool().begin().await?;
+    let source = database
+        .sources()
+        .get(source_id)
+        .await?
+        .ok_or_else(|| anyhow!("source not found"))?;
+    sqlx::query(
+        r#"
+        update sources
+        set ingestion_status = 'completed',
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(source_id)
+    .execute(&mut *tx)
+    .await?;
+    database
+        .media_assets()
+        .upsert_ingested(
+            &mut *tx,
+            crate::media_asset::MediaAssetUpsert {
+                project_id: source.project_id,
+                source_id,
+                media_kind: media_kind.to_string(),
+                staged_path: staged_path.to_string_lossy().to_string(),
+                original_filename: original_filename.map(str::to_string),
+                byte_size,
+                ingestion_status: "ready".to_string(),
+            },
+        )
+        .await?;
+    sqlx::query(
+        r#"
+        update jobs
+        set status = 'completed',
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn download_url_to_staging(
@@ -365,8 +445,8 @@ mod tests {
         let source_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, created_at, updated_at)
-            values ($1, $2, $3, $4, $5, $6, now(), now())
+            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, now(), now())
             "#,
         )
         .bind(source_id)
@@ -375,6 +455,7 @@ mod tests {
         .bind(Some("https://example.com/video"))
         .bind("url:https://example.com/video")
         .bind(Option::<String>::None)
+        .bind("pending")
         .execute(database.pool())
         .await
         .expect("source should insert");
@@ -421,8 +502,8 @@ mod tests {
         let source_id = Uuid::new_v4();
         sqlx::query(
             r#"
-            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, created_at, updated_at)
-            values ($1, $2, $3, $4, $5, $6, now(), now())
+            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, now(), now())
             "#,
         )
         .bind(source_id)
@@ -431,6 +512,7 @@ mod tests {
         .bind(Some("https://example.com/video"))
         .bind("url:https://example.com/video")
         .bind(Option::<String>::None)
+        .bind("pending")
         .execute(database.pool())
         .await
         .expect("source should insert");

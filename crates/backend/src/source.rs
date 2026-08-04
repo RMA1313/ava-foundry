@@ -49,6 +49,7 @@ pub struct Source {
     pub original_url: Option<String>,
     pub normalized_identity: String,
     pub import_metadata: Option<String>,
+    pub ingestion_status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -77,13 +78,13 @@ impl SourceRepository {
             r#"
             insert into sources (
                 id, project_id, source_type, original_url,
-                normalized_identity, import_metadata, created_at, updated_at
+                normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, now(), now())
+            values ($1, $2, $3, $4, $5, $6, 'pending', now(), now())
             on conflict (project_id, normalized_identity)
             do update set updated_at = excluded.updated_at
             returning id, project_id, source_type, original_url,
-                      normalized_identity, import_metadata, created_at, updated_at
+                      normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -102,7 +103,7 @@ impl SourceRepository {
         let row = sqlx::query(
             r#"
             select id, project_id, source_type, original_url,
-                   normalized_identity, import_metadata, created_at, updated_at
+                   normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             from sources
             where id = $1
             "#,
@@ -117,7 +118,7 @@ impl SourceRepository {
         let rows = sqlx::query(
             r#"
             select id, project_id, source_type, original_url,
-                   normalized_identity, import_metadata, created_at, updated_at
+                   normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             from sources
             where project_id = $1
             order by created_at asc, id asc
@@ -137,7 +138,7 @@ impl SourceRepository {
         let row = sqlx::query(
             r#"
             select id, project_id, source_type, original_url,
-                   normalized_identity, import_metadata, created_at, updated_at
+                   normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             from sources
             where project_id = $1 and normalized_identity = $2
             "#,
@@ -161,11 +162,33 @@ impl SourceRepository {
                 updated_at = now()
             where id = $1
             returning id, project_id, source_type, original_url,
-                      normalized_identity, import_metadata, created_at, updated_at
+                      normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             "#,
         )
         .bind(id)
         .bind(import_metadata)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(source_from_row).transpose()
+    }
+
+    pub async fn update_ingestion_status(
+        &self,
+        id: Uuid,
+        ingestion_status: &str,
+    ) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            r#"
+            update sources
+            set ingestion_status = $2,
+                updated_at = now()
+            where id = $1
+            returning id, project_id, source_type, original_url,
+                      normalized_identity, import_metadata, ingestion_status, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(ingestion_status)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(source_from_row).transpose()
@@ -210,6 +233,7 @@ fn source_from_row(row: &PgRow) -> Result<Source> {
         original_url: row.try_get("original_url")?,
         normalized_identity: row.try_get("normalized_identity")?,
         import_metadata: row.try_get("import_metadata")?,
+        ingestion_status: row.try_get("ingestion_status")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

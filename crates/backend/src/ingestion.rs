@@ -1,12 +1,17 @@
 use std::{
     fs,
-    io::BufReader,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use flate2::read::GzDecoder;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
+use serde_json::Value;
 use walkdir::WalkDir;
+use zip::read::ZipArchive;
 
 use crate::{db::Database, job::JobType, source::SourceType};
 
@@ -107,6 +112,10 @@ pub async fn import_local_file_to_staging(
     let _ = database
         .sources()
         .update_import_metadata(source_id, Some(&metadata))
+        .await?;
+    let _ = database
+        .sources()
+        .update_ingestion_status(source_id, "staged")
         .await?;
     Ok((final_path, size))
 }
@@ -249,6 +258,270 @@ pub async fn import_csv_urls(
         }
     }
     Ok(summary)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetItemResult {
+    pub source_id: uuid::Uuid,
+    pub job_id: uuid::Uuid,
+    pub metadata: Value,
+}
+
+pub async fn import_dataset_manifest(
+    database: &Database,
+    project_id: uuid::Uuid,
+    manifest_path: &Path,
+    audio_path_field: &str,
+) -> Result<Vec<DatasetItemResult>> {
+    let mut results = Vec::new();
+    match manifest_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("csv") => {
+            let mut reader = csv::Reader::from_path(manifest_path)?;
+            let headers = reader.headers()?.clone();
+            let audio_index = headers
+                .iter()
+                .position(|h| h.trim() == audio_path_field)
+                .ok_or_else(|| anyhow!("manifest missing audio path field"))?;
+            for record in reader.records() {
+                let record = record?;
+                if let Some(result) = register_manifest_record(
+                    database,
+                    project_id,
+                    manifest_path.parent().unwrap_or_else(|| Path::new(".")),
+                    &headers,
+                    audio_index,
+                    &record,
+                )
+                .await?
+                {
+                    results.push(result);
+                }
+            }
+        }
+        Some("jsonl") | Some("json") => {
+            let file = fs::File::open(manifest_path)?;
+            for line in BufReader::new(file).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: Value = serde_json::from_str(&line)?;
+                if let Some(result) = register_json_record(
+                    database,
+                    project_id,
+                    manifest_path.parent().unwrap_or_else(|| Path::new(".")),
+                    audio_path_field,
+                    &record,
+                )
+                .await?
+                {
+                    results.push(result);
+                }
+            }
+        }
+        Some("parquet") => {
+            let file = fs::File::open(manifest_path)?;
+            let reader = SerializedFileReader::new(file)?;
+            let iter = reader.get_row_iter(None)?;
+            for row in iter {
+                let row = row?;
+                let mut record = serde_json::Map::new();
+                for index in 0..row.len() {
+                    let key = format!("col_{index}");
+                    let value = row
+                        .get_string(index)
+                        .map(|value| Value::String(value.to_string()))
+                        .unwrap_or(Value::Null);
+                    record.insert(key, value);
+                }
+                let record = Value::Object(record);
+                if let Some(result) = register_json_record(
+                    database,
+                    project_id,
+                    manifest_path.parent().unwrap_or_else(|| Path::new(".")),
+                    audio_path_field,
+                    &record,
+                )
+                .await?
+                {
+                    results.push(result);
+                }
+            }
+        }
+        _ => return Err(anyhow!("unsupported manifest format")),
+    }
+    Ok(results)
+}
+
+async fn register_manifest_record(
+    database: &Database,
+    project_id: uuid::Uuid,
+    root: &Path,
+    headers: &csv::StringRecord,
+    audio_index: usize,
+    record: &csv::StringRecord,
+) -> Result<Option<DatasetItemResult>> {
+    let mut metadata = serde_json::Map::new();
+    for (i, header) in headers.iter().enumerate() {
+        if i != audio_index {
+            metadata.insert(
+                header.to_string(),
+                Value::String(record.get(i).unwrap_or_default().to_string()),
+            );
+        }
+    }
+    let path = record.get(audio_index).unwrap_or("").trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+    register_manifest_path(database, project_id, root, path, Value::Object(metadata)).await
+}
+
+async fn register_json_record(
+    database: &Database,
+    project_id: uuid::Uuid,
+    root: &Path,
+    audio_path_field: &str,
+    record: &Value,
+) -> Result<Option<DatasetItemResult>> {
+    let obj = match record.as_object() {
+        Some(obj) => obj,
+        None => return Ok(None),
+    };
+    let path = obj
+        .get(audio_path_field)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut metadata = obj.clone();
+    metadata.remove(audio_path_field);
+    if path.is_empty() {
+        return Ok(None);
+    }
+    register_manifest_path(database, project_id, root, &path, Value::Object(metadata)).await
+}
+
+async fn register_manifest_path(
+    database: &Database,
+    project_id: uuid::Uuid,
+    root: &Path,
+    relative_path: &str,
+    metadata: Value,
+) -> Result<Option<DatasetItemResult>> {
+    let audio_path = root.join(relative_path);
+    if !audio_path.exists() {
+        return Ok(None);
+    }
+    let source = database
+        .sources()
+        .create(
+            project_id,
+            SourceType::ExistingDataset,
+            Some(audio_path.to_string_lossy().as_ref()),
+            Some(&metadata.to_string()),
+        )
+        .await?;
+    let job = database
+        .jobs()
+        .create(
+            project_id,
+            Some(source.id),
+            JobType::MediaIngestion,
+            0,
+            Utc::now(),
+        )
+        .await?;
+    Ok(Some(DatasetItemResult {
+        source_id: source.id,
+        job_id: job.id,
+        metadata,
+    }))
+}
+
+pub async fn extract_archive(archive_path: &Path, output_dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(output_dir)?;
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("archive");
+    let extract_dir = output_dir.join(format!("extract-{}", archive_name));
+    fs::create_dir_all(&extract_dir)?;
+    match archive_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("zip") => {
+            let file = fs::File::open(archive_path)?;
+            let mut archive = ZipArchive::new(file)?;
+            extract_zip(&mut archive, &extract_dir)?;
+        }
+        Some("tar") => {
+            let file = fs::File::open(archive_path)?;
+            let mut archive = tar::Archive::new(file);
+            extract_tar(&mut archive, &extract_dir)?;
+        }
+        Some("gz") | Some("tgz") => {
+            let file = fs::File::open(archive_path)?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            extract_tar(&mut archive, &extract_dir)?;
+        }
+        _ => return Err(anyhow!("unsupported archive format")),
+    }
+    Ok(extract_dir)
+}
+
+fn extract_zip<R: std::io::Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    output_dir: &Path,
+) -> Result<()> {
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let out = safe_join(output_dir, file.name())?;
+        if file.is_dir() {
+            fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut outfile = fs::File::create(out)?;
+        std::io::copy(&mut file, &mut outfile)?;
+    }
+    Ok(())
+}
+
+fn extract_tar<R: std::io::Read>(archive: &mut tar::Archive<R>, output_dir: &Path) -> Result<()> {
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let out = safe_join(output_dir, path.to_string_lossy().as_ref())?;
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        entry.unpack(out)?;
+    }
+    Ok(())
+}
+
+fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
+    let candidate = base.join(relative);
+    let normalized = candidate.components().fold(PathBuf::new(), |mut acc, c| {
+        acc.push(c);
+        acc
+    });
+    if !normalized.starts_with(base) {
+        return Err(anyhow!("archive entry attempted path traversal"));
+    }
+    Ok(normalized)
 }
 
 fn validate_public_url(url: &str) -> Result<()> {

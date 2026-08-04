@@ -53,8 +53,8 @@ async fn seed_source(pool: &PgPool, project_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"
-        insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, created_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, now(), now())
+        insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, now(), now())
         "#,
     )
     .bind(id)
@@ -63,6 +63,7 @@ async fn seed_source(pool: &PgPool, project_id: Uuid) -> Uuid {
     .bind(Some("https://youtu.be/abcd1234"))
     .bind("url:youtube:abcd1234")
     .bind(Option::<String>::None)
+    .bind("pending")
     .execute(pool)
     .await
     .expect("source should insert");

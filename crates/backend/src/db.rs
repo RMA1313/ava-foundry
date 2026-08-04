@@ -2,6 +2,7 @@ use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
 use crate::job::JobRepository;
+use crate::media_asset::MediaAssetRepository;
 use crate::project::ProjectRepository;
 use crate::source::SourceRepository;
 
@@ -37,6 +38,10 @@ impl Database {
 
     pub fn sources(&self) -> SourceRepository {
         SourceRepository::new(self.pool.clone())
+    }
+
+    pub fn media_assets(&self) -> MediaAssetRepository {
+        MediaAssetRepository::new(self.pool.clone())
     }
 
     pub async fn is_ready(&self) -> bool {

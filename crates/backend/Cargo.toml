@@ -18,6 +18,10 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 csv = "1"
+flate2 = "1"
+tar = "0.4"
+zip = "2"
+parquet = "53"
 
 [dev-dependencies]
 assert_cmd = "2"

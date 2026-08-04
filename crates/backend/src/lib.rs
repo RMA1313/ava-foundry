@@ -4,6 +4,7 @@ pub mod download;
 pub mod http;
 pub mod ingestion;
 pub mod job;
+pub mod media_asset;
 pub mod migrations;
 pub mod project;
 pub mod server;

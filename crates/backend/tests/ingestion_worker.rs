@@ -7,7 +7,7 @@ use backend::{
     migrations,
     server::AppState,
     source::SourceType,
-    worker::{media_ingestion_handler, WorkerRuntime},
+    worker::{media_ingestion_handler, JobHandler, WorkerRuntime},
 };
 use chrono::Utc;
 use sqlx::PgPool;
@@ -140,6 +140,21 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
         .unwrap()
         .unwrap();
     assert_eq!(fetched.status, JobStatus::Completed);
+    let source = database_for_runtime
+        .sources()
+        .get(source.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.ingestion_status, "completed");
+    let asset = database_for_runtime
+        .media_assets()
+        .get_by_source(source.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(asset.project_id, project_id);
+    assert_eq!(asset.media_kind, "video");
     let staged = temp_dir.path().join(format!("{}.bin", source.id));
     assert!(Path::new(&staged).exists());
 }
@@ -181,4 +196,62 @@ async fn local_file_import_reuses_completed_copy_and_ignores_partial_temp_files(
     .await
     .expect("reimport should reuse existing file");
     assert_eq!(repeated.0, staged_path);
+}
+
+#[tokio::test]
+async fn repeated_finalization_does_not_duplicate_media_assets() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool).await;
+    let database = Database::from_pool(pool.clone());
+    let source = database
+        .sources()
+        .create(
+            project_id,
+            SourceType::PublicUrl,
+            Some("https://youtu.be/abcd1234"),
+            None,
+        )
+        .await
+        .expect("source should be created");
+    let job = database
+        .jobs()
+        .create(
+            project_id,
+            Some(source.id),
+            JobType::MediaIngestion,
+            0,
+            Utc::now(),
+        )
+        .await
+        .expect("job should be created");
+    let temp_dir = TempDir::new().expect("temp dir");
+    let executable = fake_downloader(&temp_dir);
+    let handler = media_ingestion_handler(
+        temp_dir.path(),
+        backend::download::DownloadCommandAdapter::new(executable).unwrap(),
+    );
+    let state = AppState { database };
+
+    let first = handler
+        .handle(job.clone(), state.clone())
+        .await
+        .expect("first finalization should succeed");
+    assert_eq!(first, backend::worker::JobOutcome::Completed);
+    let second = handler
+        .handle(job, state.clone())
+        .await
+        .expect("second finalization should succeed");
+    assert_eq!(second, backend::worker::JobOutcome::Completed);
+
+    let assets = state
+        .database
+        .media_assets()
+        .get_by_source(source.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets[0].source_id, source.id);
 }
