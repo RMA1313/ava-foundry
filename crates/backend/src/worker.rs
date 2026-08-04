@@ -92,6 +92,14 @@ impl StagingCapacityGuard {
         self.paused.load(Ordering::SeqCst)
     }
 
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
     pub fn check(&self, path: &Path) -> Result<StagingCapacityState> {
         let free_bytes = self.metrics.free_bytes(path)?;
         let total_bytes = self.metrics.total_bytes(path)?;

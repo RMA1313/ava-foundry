@@ -383,7 +383,11 @@ pub fn router(state: AppState) -> Router {
             get(get_audio_asset),
         )
         .route("/projects/:id/duplicates", get(list_duplicate_groups))
+        .route("/projects/:id/duplicates/recover", post(recover_duplicates))
         .route("/projects/:id/metrics/summary", get(metrics_summary))
+        .route("/projects/:id/jobs/recover", post(recover_jobs))
+        .route("/projects/:id/pipeline/pause", post(pause_pipeline))
+        .route("/projects/:id/pipeline/resume", post(resume_pipeline))
         .route("/projects/:project_id/jobs/:job_id/retry", post(retry_job))
         .route(
             "/projects/:id/sources/local-file",
@@ -860,6 +864,59 @@ async fn list_duplicate_groups(
         limit: page.limit,
         offset: page.offset,
     }))
+}
+
+async fn recover_duplicates(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let _project_id = parse_uuid(&id)?;
+    let recovered = state
+        .database
+        .duplicates()
+        .recover_canonical_audio_assets()
+        .await
+        .map_err(database_error)?;
+    Ok(Json(serde_json::json!({
+        "recovered": recovered.len(),
+        "items": recovered.into_iter().map(|(duplicate_group_id, canonical_audio_asset_id)| serde_json::json!({
+            "duplicate_group_id": duplicate_group_id.to_string(),
+            "canonical_audio_asset_id": canonical_audio_asset_id.to_string(),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn recover_jobs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let recovered = state
+        .database
+        .jobs()
+        .recover_expired_leases(chrono::Utc::now())
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .filter(|job| job.project_id == project_id)
+        .count();
+    Ok(Json(serde_json::json!({ "recovered": recovered })))
+}
+
+async fn pause_pipeline(
+    State(state): State<AppState>,
+    Path(_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.staging_capacity_guard.pause();
+    Ok(Json(serde_json::json!({ "paused": true })))
+}
+
+async fn resume_pipeline(
+    State(state): State<AppState>,
+    Path(_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state.staging_capacity_guard.resume();
+    Ok(Json(serde_json::json!({ "paused": false })))
 }
 
 fn stage_run_response(run: StageRun) -> StageRunResponse {

@@ -85,6 +85,10 @@ Browse finalized audio assets.
 
 Browse duplicate groups and canonical audio.
 
+### Status
+
+Implemented in the workspace with duplicate-group cards, members, canonical audio, similarity, and load/empty/error states.
+
 ---
 
 ## P4-10 — Search & Filters
@@ -92,6 +96,10 @@ Browse duplicate groups and canonical audio.
 ### Goal
 
 Provide unified filtering and search across workspace resources.
+
+### Status
+
+Implemented with project-scoped, URL-backed search and filters across sources, jobs, media, audio, and duplicate groups.
 
 ---
 
@@ -101,6 +109,10 @@ Provide unified filtering and search across workspace resources.
 
 Display project progress and storage statistics.
 
+### Status
+
+Implemented with source counts, job states, media/audio counts, duplicate ratio, unique duration, storage usage, and throughput.
+
 ---
 
 ## P4-12 — Pipeline Controls
@@ -108,6 +120,10 @@ Display project progress and storage statistics.
 ### Goal
 
 Control pipeline execution and failed-job recovery.
+
+### Status
+
+Implemented with confirmed retry, recovery, pause, and resume controls for supported backend actions.
 
 ---
 

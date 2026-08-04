@@ -214,6 +214,22 @@ export async function fetchProjectDuplicateGroups(baseUrl: string, projectId: st
   return body.items;
 }
 
+export async function recoverDuplicates(baseUrl: string, projectId: string) {
+  return requestJson(`${baseUrl}/projects/${projectId}/duplicates/recover`, { method: "POST", body: JSON.stringify({}) });
+}
+
+export async function recoverJobs(baseUrl: string, projectId: string) {
+  return requestJson(`${baseUrl}/projects/${projectId}/jobs/recover`, { method: "POST", body: JSON.stringify({}) });
+}
+
+export async function pausePipeline(baseUrl: string, projectId: string) {
+  return requestJson(`${baseUrl}/projects/${projectId}/pipeline/pause`, { method: "POST", body: JSON.stringify({}) });
+}
+
+export async function resumePipeline(baseUrl: string, projectId: string) {
+  return requestJson(`${baseUrl}/projects/${projectId}/pipeline/resume`, { method: "POST", body: JSON.stringify({}) });
+}
+
 export async function registerUrl(baseUrl: string, projectId: string, url: string) {
   return requestJson(`${baseUrl}/projects/${projectId}/sources/url`, {
     method: "POST",
