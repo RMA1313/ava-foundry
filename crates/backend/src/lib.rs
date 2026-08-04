@@ -1,3 +1,4 @@
+pub mod audio_asset;
 pub mod config;
 pub mod db;
 pub mod download;
@@ -10,4 +11,5 @@ pub mod migrations;
 pub mod project;
 pub mod server;
 pub mod source;
+pub mod storage;
 pub mod worker;

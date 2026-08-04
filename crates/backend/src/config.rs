@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub data_dir: PathBuf,
     pub temp_dir: PathBuf,
+    pub audio_dir: PathBuf,
+    pub audio_temp_dir: PathBuf,
     pub staging_pause_free_bytes: u64,
     pub staging_resume_free_bytes: u64,
     pub host: String,
@@ -29,6 +31,14 @@ impl AppConfig {
             std::env::var("DATA_STUDIO_TEMP_DIR")
                 .unwrap_or_else(|_| data_dir.join("tmp").to_string_lossy().into_owned()),
         );
+        let audio_dir = PathBuf::from(
+            std::env::var("DATA_STUDIO_AUDIO_DIR")
+                .unwrap_or_else(|_| data_dir.join("audio").to_string_lossy().into_owned()),
+        );
+        let audio_temp_dir = PathBuf::from(
+            std::env::var("DATA_STUDIO_AUDIO_TEMP_DIR")
+                .unwrap_or_else(|_| temp_dir.join("audio").to_string_lossy().into_owned()),
+        );
         let staging_pause_free_bytes = std::env::var("DATA_STUDIO_STAGING_PAUSE_FREE_BYTES")
             .unwrap_or_else(|_| "1073741824".to_string())
             .parse::<u64>()
@@ -48,6 +58,8 @@ impl AppConfig {
             workspace_dir,
             data_dir,
             temp_dir,
+            audio_dir,
+            audio_temp_dir,
             staging_pause_free_bytes,
             staging_resume_free_bytes,
             host,

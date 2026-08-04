@@ -11,4 +11,9 @@ fn defaults_are_deterministic() {
     let config = AppConfig::load_from_env().unwrap();
     assert_eq!(config.data_dir, Path::new("/workspace/data"));
     assert_eq!(config.temp_dir, Path::new("/workspace/data/tmp"));
+    assert_eq!(config.audio_dir, Path::new("/workspace/data/audio"));
+    assert_eq!(
+        config.audio_temp_dir,
+        Path::new("/workspace/data/tmp/audio")
+    );
 }

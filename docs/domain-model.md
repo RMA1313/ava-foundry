@@ -98,6 +98,9 @@ Responsibilities:
 
 Audio assets are the primary business objects.
 
+Technical metadata is preserved on each audio asset, including duration, container format,
+codec, sample rate, channel count, byte size, and local storage path.
+
 ---
 
 ## Audio Interval
