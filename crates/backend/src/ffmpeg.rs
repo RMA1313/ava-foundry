@@ -12,6 +12,8 @@ use tokio::{
     time,
 };
 
+use crate::config::AudioNormalizationProfile;
+
 #[derive(Debug, Clone)]
 pub struct FfmpegAdapter {
     executable: PathBuf,
@@ -72,6 +74,38 @@ impl FfmpegAdapter {
             .arg("-progress")
             .arg("pipe:1")
             .arg("-nostats")
+            .arg(output_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    pub fn build_normalization_command(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        profile: &AudioNormalizationProfile,
+    ) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("-hide_banner")
+            .arg("-nostdin")
+            .arg("-y")
+            .arg("-i")
+            .arg(input_path)
+            .arg("-vn")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-c:a")
+            .arg(profile.codec.as_str())
+            .arg("-ar")
+            .arg(profile.sample_rate_hz.to_string())
+            .arg("-ac")
+            .arg(profile.channels.to_string())
+            .arg("-f")
+            .arg(profile.format.as_str())
             .arg(output_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

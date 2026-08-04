@@ -5,6 +5,8 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use backend::config::AudioNormalizationProfile;
+use backend::storage::AudioStorageConfig;
 use backend::worker::{DefaultFilesystemMetrics, StagingCapacityGuard};
 use backend::{db::Database, migrations, server::AppState};
 use serde_json::Value;
@@ -42,6 +44,11 @@ async fn router() -> Router {
     let state = AppState {
         database: Database::from_pool(pool),
         staging_dir: PathBuf::from("/tmp"),
+        audio_storage: AudioStorageConfig::new(
+            PathBuf::from("/tmp/audio"),
+            PathBuf::from("/tmp/audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
     };
     backend::http::router(state)

@@ -33,6 +33,14 @@ impl AudioStorageConfig {
         )
     }
 
+    pub fn temporary_normalization_path(&self, media_asset_id: Uuid) -> Result<PathBuf> {
+        path_within_root(
+            &self.temporary_root,
+            &["audio-normalization", &media_asset_id.to_string()],
+            Some("tmp"),
+        )
+    }
+
     pub fn ensure_roots(&self) -> Result<()> {
         fs::create_dir_all(&self.permanent_root)
             .with_context(|| format!("create {}", self.permanent_root.display()))?;

@@ -1,6 +1,8 @@
 mod support;
 
+use backend::storage::AudioStorageConfig;
 use backend::{
+    config::AudioNormalizationProfile,
     db::Database,
     ingestion,
     job::{JobStatus, JobType},
@@ -124,6 +126,11 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
     let state = AppState {
         database,
         staging_dir: temp_dir.path().to_path_buf(),
+        audio_storage: AudioStorageConfig::new(
+            temp_dir.path().join("audio"),
+            temp_dir.path().join("audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -241,6 +248,11 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
     let state = AppState {
         database,
         staging_dir: temp_dir.path().to_path_buf(),
+        audio_storage: AudioStorageConfig::new(
+            temp_dir.path().join("audio"),
+            temp_dir.path().join("audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
     };
 

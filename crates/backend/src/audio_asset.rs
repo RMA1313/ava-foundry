@@ -9,6 +9,10 @@ pub struct AudioAsset {
     pub media_asset_id: Uuid,
     pub project_id: Uuid,
     pub processing_status: String,
+    pub normalization_profile: Option<String>,
+    pub validation_status: Option<String>,
+    pub validation_error: Option<String>,
+    pub validated_at: Option<DateTime<Utc>>,
     pub duration_seconds: f64,
     pub audio_format: String,
     pub codec: String,
@@ -25,6 +29,10 @@ pub struct AudioAssetUpsert {
     pub media_asset_id: Uuid,
     pub project_id: Uuid,
     pub processing_status: String,
+    pub normalization_profile: Option<String>,
+    pub validation_status: Option<String>,
+    pub validation_error: Option<String>,
+    pub validated_at: Option<DateTime<Utc>>,
     pub duration_seconds: f64,
     pub audio_format: String,
     pub codec: String,
@@ -53,15 +61,20 @@ impl AudioAssetRepository {
             r#"
             insert into audio_assets (
                 id, media_asset_id, project_id, processing_status, duration_seconds,
+                normalization_profile, validation_status, validation_error, validated_at,
                 audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
                 created_at, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now())
             on conflict (media_asset_id)
             do update set
                 project_id = excluded.project_id,
                 processing_status = excluded.processing_status,
                 duration_seconds = excluded.duration_seconds,
+                normalization_profile = excluded.normalization_profile,
+                validation_status = excluded.validation_status,
+                validation_error = excluded.validation_error,
+                validated_at = excluded.validated_at,
                 audio_format = excluded.audio_format,
                 codec = excluded.codec,
                 sample_rate_hz = excluded.sample_rate_hz,
@@ -70,6 +83,7 @@ impl AudioAssetRepository {
                 storage_path = excluded.storage_path,
                 updated_at = excluded.updated_at
             returning id, media_asset_id, project_id, processing_status, duration_seconds,
+                      normalization_profile, validation_status, validation_error, validated_at,
                       audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
                       created_at, updated_at
             "#,
@@ -79,6 +93,10 @@ impl AudioAssetRepository {
         .bind(request.project_id)
         .bind(request.processing_status.as_str())
         .bind(request.duration_seconds)
+        .bind(request.normalization_profile.as_deref())
+        .bind(request.validation_status.as_deref())
+        .bind(request.validation_error.as_deref())
+        .bind(request.validated_at)
         .bind(request.audio_format.as_str())
         .bind(request.codec.as_str())
         .bind(request.sample_rate_hz)
@@ -94,6 +112,7 @@ impl AudioAssetRepository {
         let row = sqlx::query(
             r#"
             select id, media_asset_id, project_id, processing_status, duration_seconds,
+                   normalization_profile, validation_status, validation_error, validated_at,
                    audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
                    created_at, updated_at
             from audio_assets
@@ -110,6 +129,7 @@ impl AudioAssetRepository {
         let rows = sqlx::query(
             r#"
             select id, media_asset_id, project_id, processing_status, duration_seconds,
+                   normalization_profile, validation_status, validation_error, validated_at,
                    audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
                    created_at, updated_at
             from audio_assets
@@ -122,6 +142,23 @@ impl AudioAssetRepository {
         .await?;
         rows.iter().map(audio_asset_from_row).collect()
     }
+
+    pub async fn get_by_media_asset(&self, media_asset_id: Uuid) -> Result<Option<AudioAsset>> {
+        let row = sqlx::query(
+            r#"
+            select id, media_asset_id, project_id, processing_status, duration_seconds,
+                   normalization_profile, validation_status, validation_error, validated_at,
+                   audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
+                   created_at, updated_at
+            from audio_assets
+            where media_asset_id = $1
+            "#,
+        )
+        .bind(media_asset_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(audio_asset_from_row).transpose()
+    }
 }
 
 fn audio_asset_from_row(row: &PgRow) -> Result<AudioAsset> {
@@ -131,6 +168,10 @@ fn audio_asset_from_row(row: &PgRow) -> Result<AudioAsset> {
         project_id: row.try_get("project_id")?,
         processing_status: row.try_get("processing_status")?,
         duration_seconds: row.try_get("duration_seconds")?,
+        normalization_profile: row.try_get("normalization_profile")?,
+        validation_status: row.try_get("validation_status")?,
+        validation_error: row.try_get("validation_error")?,
+        validated_at: row.try_get("validated_at")?,
         audio_format: row.try_get("audio_format")?,
         codec: row.try_get("codec")?,
         sample_rate_hz: row.try_get("sample_rate_hz")?,

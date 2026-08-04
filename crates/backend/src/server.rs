@@ -4,12 +4,17 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::{db::Database, http, worker::StagingCapacityGuard};
+use crate::{
+    config::AudioNormalizationProfile, db::Database, http, storage::AudioStorageConfig,
+    worker::StagingCapacityGuard,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub database: Database,
     pub staging_dir: PathBuf,
+    pub audio_storage: AudioStorageConfig,
+    pub audio_normalization_profile: AudioNormalizationProfile,
     pub staging_capacity_guard: Arc<StagingCapacityGuard>,
 }
 

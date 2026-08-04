@@ -117,6 +117,10 @@ async fn repository_round_trip_and_idempotency_work() {
                 channels: 1,
                 byte_size: 1024,
                 storage_path: "/data/audio/audio-assets/asset.flac".to_string(),
+                normalization_profile: Some("flac:flac:16000:1".to_string()),
+                validation_status: Some("validated".to_string()),
+                validation_error: None,
+                validated_at: Some(chrono::Utc::now()),
             },
         )
         .await
@@ -136,6 +140,10 @@ async fn repository_round_trip_and_idempotency_work() {
                 channels: 1,
                 byte_size: 1024,
                 storage_path: "/data/audio/audio-assets/asset.flac".to_string(),
+                normalization_profile: Some("flac:flac:16000:1".to_string()),
+                validation_status: Some("validated".to_string()),
+                validation_error: None,
+                validated_at: Some(chrono::Utc::now()),
             },
         )
         .await

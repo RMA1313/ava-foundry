@@ -4,7 +4,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use backend::{db::Database, job::JobType, migrations, server::AppState, source::SourceType};
+use backend::{
+    config::AudioNormalizationProfile, db::Database, job::JobType, migrations, server::AppState,
+    source::SourceType, storage::AudioStorageConfig,
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::{env, path::PathBuf, sync::Arc};
@@ -145,6 +148,11 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
     let app = backend::http::router(AppState {
         database,
         staging_dir: PathBuf::from("/tmp"),
+        audio_storage: AudioStorageConfig::new(
+            PathBuf::from("/tmp/audio"),
+            PathBuf::from("/tmp/audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
             1,
             2,
@@ -309,6 +317,11 @@ async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
     let app = backend::http::router(AppState {
         database,
         staging_dir: PathBuf::from("/tmp"),
+        audio_storage: AudioStorageConfig::new(
+            PathBuf::from("/tmp/audio"),
+            PathBuf::from("/tmp/audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
             1,
             2,
@@ -371,6 +384,11 @@ async fn staging_capacity_endpoint_reports_guard_state() {
     let app = backend::http::router(AppState {
         database,
         staging_dir: PathBuf::from("/tmp"),
+        audio_storage: AudioStorageConfig::new(
+            PathBuf::from("/tmp/audio"),
+            PathBuf::from("/tmp/audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
         staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
             1,
             2,

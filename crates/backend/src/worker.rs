@@ -17,6 +17,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::info;
 
 use crate::{
+    config::AudioNormalizationProfile,
     download::DownloadCommandAdapter,
     ffmpeg::FfmpegAdapter,
     ffprobe::{FfprobeAdapter, FfprobeOutput},
@@ -372,6 +373,19 @@ pub fn audio_extraction_handler(ffmpeg_path: impl Into<PathBuf>) -> impl JobHand
     }
 }
 
+pub fn audio_validation_handler(
+    ffmpeg_path: impl Into<PathBuf>,
+    ffprobe_path: impl Into<PathBuf>,
+) -> impl JobHandler {
+    let ffmpeg_path = ffmpeg_path.into();
+    let ffprobe_path = ffprobe_path.into();
+    move |job: Job, state: AppState| {
+        let ffmpeg_path = ffmpeg_path.clone();
+        let ffprobe_path = ffprobe_path.clone();
+        async move { handle_audio_validation_job(&state, job, &ffmpeg_path, &ffprobe_path).await }
+    }
+}
+
 async fn handle_media_ingestion_job(
     state: &AppState,
     job: Job,
@@ -722,6 +736,7 @@ mod tests {
         db::Database,
         job::{JobRepository, JobStatus},
         migrations,
+        storage::AudioStorageConfig,
     };
     use chrono::Utc;
     use sqlx::PgPool;
@@ -867,6 +882,12 @@ mod tests {
                 AppState {
                     database: database.clone(),
                     staging_dir: PathBuf::from("/tmp/staging"),
+                    audio_storage: AudioStorageConfig::new(
+                        PathBuf::from("/tmp/audio"),
+                        PathBuf::from("/tmp/audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
                     staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                         1,
                         2,
@@ -942,6 +963,12 @@ mod tests {
                 AppState {
                     database,
                     staging_dir: PathBuf::from("/tmp/staging"),
+                    audio_storage: AudioStorageConfig::new(
+                        PathBuf::from("/tmp/audio"),
+                        PathBuf::from("/tmp/audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
                     staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                         1,
                         2,
@@ -1037,6 +1064,15 @@ mod tests {
         path
     }
 
+    fn fake_ffprobe_validation(dir: &TempDir, script: &str) -> PathBuf {
+        let path = dir.path().join("fake-ffprobe");
+        fs::write(&path, script).expect("script should write");
+        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("permissions");
+        path
+    }
+
     #[tokio::test]
     async fn worker_runtime_persists_inspected_media_metadata() {
         clear_env();
@@ -1076,6 +1112,12 @@ mod tests {
                 AppState {
                     database: database.clone(),
                     staging_dir: temp_dir.path().to_path_buf(),
+                    audio_storage: AudioStorageConfig::new(
+                        PathBuf::from("/tmp/audio"),
+                        PathBuf::from("/tmp/audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
                     staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                         1,
                         2,
@@ -1135,6 +1177,11 @@ mod tests {
         let state = AppState {
             database: database.clone(),
             staging_dir: temp_dir.path().to_path_buf(),
+            audio_storage: AudioStorageConfig::new(
+                PathBuf::from("/tmp/audio"),
+                PathBuf::from("/tmp/audio-tmp"),
+            ),
+            audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
             staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                 1,
                 2,
@@ -1211,6 +1258,12 @@ mod tests {
                 AppState {
                     database: database.clone(),
                     staging_dir: staging_dir.clone(),
+                    audio_storage: AudioStorageConfig::new(
+                        PathBuf::from("/tmp/audio"),
+                        PathBuf::from("/tmp/audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
                     staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                         1,
                         2,
@@ -1283,6 +1336,12 @@ mod tests {
                 AppState {
                     database: database.clone(),
                     staging_dir: staging_dir.clone(),
+                    audio_storage: AudioStorageConfig::new(
+                        PathBuf::from("/tmp/audio"),
+                        PathBuf::from("/tmp/audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
                     staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
                         1,
                         2,
@@ -1305,6 +1364,177 @@ mod tests {
             .unwrap();
         assert_eq!(asset.extraction_status.as_deref(), Some("failed"));
         assert_eq!(asset.extraction_tmp_path.as_deref(), None);
+    }
+
+    async fn seed_validating_media_asset(
+        pool: &PgPool,
+        temp_dir: &TempDir,
+    ) -> (Uuid, Uuid, Uuid, PathBuf) {
+        let (project_id, source_id, media_asset_id) = seed_inspectable_media_asset(pool).await;
+        let extraction_tmp = temp_dir.path().join(format!("{}.flac.tmp", media_asset_id));
+        fs::write(&extraction_tmp, b"raw-audio").expect("extraction temp should write");
+        sqlx::query(
+            r#"
+            update media_assets
+            set extraction_tmp_path = $2,
+                extraction_status = 'completed',
+                updated_at = now()
+            where id = $1
+            "#,
+        )
+        .bind(media_asset_id)
+        .bind(extraction_tmp.to_string_lossy().to_string())
+        .execute(pool)
+        .await
+        .expect("media asset should update");
+        (project_id, source_id, media_asset_id, extraction_tmp)
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_normalizes_and_validates_audio_with_profile() {
+        clear_env();
+        let pool = test_pool().await;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (project_id, _source_id, media_asset_id, extraction_tmp) =
+            seed_validating_media_asset(&pool, &temp_dir).await;
+        let database = Database::from_pool(pool.clone());
+        let ffmpeg = fake_ffmpeg(
+            &temp_dir,
+            "#!/bin/sh\nfor arg in \"$@\"; do :; done\ninput=\"$3\"\noutput=\"$@\"\nfor last; do :; done\ncp \"$INPUT_FILE\" \"$last\"\nprintf 'out_time_ms=1000\\nprogress=continue\\nprogress=end\\n'\n",
+        );
+        let ffprobe = fake_ffprobe_validation(
+            &temp_dir,
+            "#!/bin/sh\ncat <<'JSON'\n{\"format\":{\"format_name\":\"flac\",\"duration\":\"1.0\"},\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"flac\",\"sample_rate\":\"16000\",\"channels\":1}]}\nJSON\n",
+        );
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::AudioValidation,
+            audio_validation_handler(ffmpeg, ffprobe),
+        );
+        let job = Job {
+            id: Uuid::new_v4(),
+            project_id,
+            source_id: Some(media_asset_id),
+            job_type: JobType::AudioValidation,
+            status: JobStatus::Running,
+            priority: 0,
+            attempts: 0,
+            available_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            failure_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let handlers = runtime.handlers.clone();
+        std::env::set_var("INPUT_FILE", extraction_tmp.to_string_lossy().to_string());
+        runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                    staging_dir: temp_dir.path().to_path_buf(),
+                    audio_storage: AudioStorageConfig::new(
+                        temp_dir.path().join("audio"),
+                        temp_dir.path().join("audio-tmp"),
+                    ),
+                    audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(
+                    ),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                job,
+            )
+            .await
+            .expect("validation should succeed");
+        let asset = database
+            .audio_assets()
+            .get_by_media_asset(media_asset_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.processing_status, "validated");
+        assert_eq!(
+            asset.normalization_profile.as_deref(),
+            Some("flac:flac:16000:1")
+        );
+        assert_eq!(asset.validation_status.as_deref(), Some("validated"));
+        assert!(asset.validated_at.is_some());
+        assert_eq!(asset.audio_format, "flac");
+        assert_eq!(asset.sample_rate_hz, 16000);
+        assert_eq!(asset.channels, 1);
+        assert_eq!(
+            asset.storage_path,
+            temp_dir
+                .path()
+                .join("audio-tmp")
+                .join("audio-normalization")
+                .join(media_asset_id.to_string())
+                .with_extension("tmp")
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_rejects_empty_normalized_audio() {
+        clear_env();
+        let pool = test_pool().await;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (project_id, _source_id, media_asset_id, extraction_tmp) =
+            seed_validating_media_asset(&pool, &temp_dir).await;
+        let database = Database::from_pool(pool.clone());
+        let ffmpeg = fake_ffmpeg(
+            &temp_dir,
+            "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+        );
+        let ffprobe = fake_ffprobe_validation(&temp_dir, "#!/bin/sh\nexit 1\n");
+        let job = Job {
+            id: Uuid::new_v4(),
+            project_id,
+            source_id: Some(media_asset_id),
+            job_type: JobType::AudioValidation,
+            status: JobStatus::Running,
+            priority: 0,
+            attempts: 0,
+            available_at: Utc::now(),
+            lease_expires_at: None,
+            worker_id: None,
+            failure_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        std::env::set_var("INPUT_FILE", extraction_tmp.to_string_lossy().to_string());
+        let outcome = handle_audio_validation_job(
+            &AppState {
+                database: database.clone(),
+                staging_dir: temp_dir.path().to_path_buf(),
+                audio_storage: AudioStorageConfig::new(
+                    temp_dir.path().join("audio"),
+                    temp_dir.path().join("audio-tmp"),
+                ),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            },
+            job,
+            &ffmpeg,
+            &ffprobe,
+        )
+        .await;
+        assert!(outcome.is_ok());
+        let asset = database
+            .audio_assets()
+            .get_by_media_asset(media_asset_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.validation_status.as_deref(), Some("rejected"));
     }
 
     #[test]
@@ -1492,4 +1722,246 @@ async fn persist_audio_extraction_state(
         )
         .await?;
     Ok(())
+}
+
+async fn handle_audio_validation_job(
+    state: &AppState,
+    job: Job,
+    ffmpeg_path: &Path,
+    ffprobe_path: &Path,
+) -> Result<JobOutcome> {
+    let media_asset_id = job
+        .source_id
+        .ok_or_else(|| anyhow!("audio validation job requires a media asset id"))?;
+    let media_asset = state
+        .database
+        .media_assets()
+        .get(media_asset_id)
+        .await?
+        .ok_or_else(|| anyhow!("media asset not found"))?;
+    let extraction_tmp_path = media_asset
+        .extraction_tmp_path
+        .clone()
+        .ok_or_else(|| anyhow!("media asset missing extracted temp path"))?;
+    let profile = state.audio_normalization_profile.clone();
+    let profile_string = profile_label(&profile);
+    let adapter = FfmpegAdapter::new(ffmpeg_path)?;
+    let ffprobe = FfprobeAdapter::new(ffprobe_path)?;
+    let normalized_path = state
+        .audio_storage
+        .temporary_normalization_path(media_asset_id)?;
+    if let Some(parent) = normalized_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let _ = tokio::fs::remove_file(&normalized_path).await;
+    persist_audio_validation_state(
+        &state.database,
+        &media_asset,
+        Some("normalizing"),
+        Some(profile_string.as_str()),
+        None,
+        None,
+        Some(normalized_path.to_string_lossy().as_ref()),
+    )
+    .await?;
+    let mut process = adapter
+        .start(Path::new(&extraction_tmp_path), &normalized_path)
+        .await?;
+    while let Some(progress) = process.next_progress().await {
+        persist_audio_validation_state(
+            &state.database,
+            &media_asset,
+            Some("normalizing"),
+            Some(profile_string.as_str()),
+            Some(&progress.raw),
+            None,
+            Some(normalized_path.to_string_lossy().as_ref()),
+        )
+        .await?;
+    }
+    let output = match process.wait().await {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&normalized_path).await;
+            persist_audio_validation_state(
+                &state.database,
+                &media_asset,
+                Some("failed"),
+                Some(profile_string.as_str()),
+                None,
+                Some(&err.to_string()),
+                None,
+            )
+            .await?;
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            });
+        }
+    };
+    if !output.status.success() {
+        let _ = tokio::fs::remove_file(&normalized_path).await;
+        persist_audio_validation_state(
+            &state.database,
+            &media_asset,
+            Some("failed"),
+            Some(profile_string.as_str()),
+            None,
+            Some("ffmpeg failed"),
+            None,
+        )
+        .await?;
+        return Ok(JobOutcome::Retry {
+            failure_reason: "ffmpeg failed".to_string(),
+            retry_after: Utc::now() + chrono::Duration::minutes(5),
+        });
+    }
+    let validation = validate_normalized_audio(&ffprobe, &normalized_path, &profile).await;
+    match validation {
+        Ok(validated) => {
+            persist_audio_validation_state(
+                &state.database,
+                &media_asset,
+                Some("validated"),
+                Some(profile_string.as_str()),
+                Some("validated"),
+                None,
+                Some(normalized_path.to_string_lossy().as_ref()),
+            )
+            .await?;
+            let _ = tokio::fs::metadata(&normalized_path).await?;
+            if validated {
+                Ok(JobOutcome::Completed)
+            } else {
+                Ok(JobOutcome::Failed {
+                    failure_reason: "audio validation rejected output".to_string(),
+                })
+            }
+        }
+        Err(err) => {
+            persist_audio_validation_state(
+                &state.database,
+                &media_asset,
+                Some("rejected"),
+                Some(profile_string.as_str()),
+                Some("rejected"),
+                Some(&err.to_string()),
+                Some(normalized_path.to_string_lossy().as_ref()),
+            )
+            .await?;
+            Ok(JobOutcome::Failed {
+                failure_reason: err.to_string(),
+            })
+        }
+    }
+}
+
+async fn validate_normalized_audio(
+    ffprobe: &FfprobeAdapter,
+    path: &Path,
+    profile: &AudioNormalizationProfile,
+) -> Result<bool> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if metadata.len() == 0 {
+        return Err(anyhow!("audio output is empty"));
+    }
+    let probed = ffprobe
+        .probe(path, std::time::Duration::from_secs(5))
+        .await?;
+    let format_name = probed
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.clone())
+        .ok_or_else(|| anyhow!("audio output missing container format"))?;
+    let duration = probed
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(|value| value.parse::<f64>().ok())
+        .ok_or_else(|| anyhow!("audio output missing duration"))?;
+    if duration <= 0.0 {
+        return Err(anyhow!("audio duration must be positive"));
+    }
+    let audio_stream = probed
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .ok_or_else(|| anyhow!("audio output missing audio stream"))?;
+    let sample_rate = audio_stream
+        .sample_rate
+        .as_deref()
+        .and_then(|value| value.parse::<i32>().ok())
+        .ok_or_else(|| anyhow!("audio output missing sample rate"))?;
+    let channels = audio_stream
+        .channels
+        .ok_or_else(|| anyhow!("audio output missing channels"))?;
+    let codec = audio_stream
+        .codec_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("audio output missing codec"))?;
+    if format_name != profile.format {
+        return Err(anyhow!("audio output does not match normalization format"));
+    }
+    if codec != profile.codec {
+        return Err(anyhow!("audio output does not match normalization codec"));
+    }
+    if sample_rate != profile.sample_rate_hz {
+        return Err(anyhow!(
+            "audio output does not match normalization sample rate"
+        ));
+    }
+    if channels != profile.channels {
+        return Err(anyhow!(
+            "audio output does not match normalization channels"
+        ));
+    }
+    Ok(true)
+}
+
+async fn persist_audio_validation_state(
+    database: &crate::db::Database,
+    media_asset: &crate::media_asset::MediaAsset,
+    processing_status: Option<&str>,
+    normalization_profile: Option<&str>,
+    validation_status: Option<&str>,
+    validation_error: Option<&str>,
+    storage_path: Option<&str>,
+) -> Result<()> {
+    let _ = database
+        .audio_assets()
+        .upsert(
+            database.pool(),
+            crate::audio_asset::AudioAssetUpsert {
+                media_asset_id: media_asset.id,
+                project_id: media_asset.project_id,
+                processing_status: processing_status.unwrap_or("normalized").to_string(),
+                normalization_profile: normalization_profile.map(str::to_string),
+                validation_status: validation_status.map(str::to_string),
+                validation_error: validation_error.map(str::to_string),
+                validated_at: validation_status.map(|_| Utc::now()),
+                duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                audio_format: "flac".to_string(),
+                codec: "flac".to_string(),
+                sample_rate_hz: 16_000,
+                channels: 1,
+                byte_size: if let Some(path) = storage_path {
+                    tokio::fs::metadata(path)
+                        .await
+                        .map(|meta| meta.len() as i64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                },
+                storage_path: storage_path.unwrap_or_default().to_string(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn profile_label(profile: &AudioNormalizationProfile) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        profile.format, profile.codec, profile.sample_rate_hz, profile.channels
+    )
 }
