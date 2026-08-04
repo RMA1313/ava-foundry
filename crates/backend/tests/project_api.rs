@@ -5,9 +5,11 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use backend::worker::{DefaultFilesystemMetrics, StagingCapacityGuard};
 use backend::{db::Database, migrations, server::AppState};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::{path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -39,6 +41,8 @@ async fn router() -> Router {
     let pool = test_pool().await;
     let state = AppState {
         database: Database::from_pool(pool),
+        staging_dir: PathBuf::from("/tmp"),
+        staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
     };
     backend::http::router(state)
 }

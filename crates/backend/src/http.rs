@@ -180,6 +180,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/staging/capacity", get(staging_capacity))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/:id", get(get_project).put(update_project))
         .route("/projects/:id/sources", get(list_sources))
@@ -204,6 +205,22 @@ async fn ready(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         status: if ready { "ok" } else { "unavailable" },
     })
+}
+
+async fn staging_capacity(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let capacity = state
+        .staging_capacity_guard
+        .check(&state.staging_dir)
+        .map_err(database_error)?;
+    Ok(Json(serde_json::json!({
+        "paused": capacity.paused,
+        "free_bytes": capacity.free_bytes,
+        "total_bytes": capacity.total_bytes,
+        "pause_free_bytes": capacity.pause_free_bytes,
+        "resume_free_bytes": capacity.resume_free_bytes,
+    })))
 }
 
 async fn create_project(

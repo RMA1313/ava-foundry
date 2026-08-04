@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub data_dir: PathBuf,
     pub temp_dir: PathBuf,
+    pub staging_pause_free_bytes: u64,
+    pub staging_resume_free_bytes: u64,
     pub host: String,
     pub port: u16,
 }
@@ -27,6 +29,14 @@ impl AppConfig {
             std::env::var("DATA_STUDIO_TEMP_DIR")
                 .unwrap_or_else(|_| data_dir.join("tmp").to_string_lossy().into_owned()),
         );
+        let staging_pause_free_bytes = std::env::var("DATA_STUDIO_STAGING_PAUSE_FREE_BYTES")
+            .unwrap_or_else(|_| "1073741824".to_string())
+            .parse::<u64>()
+            .context("DATA_STUDIO_STAGING_PAUSE_FREE_BYTES must be a valid u64")?;
+        let staging_resume_free_bytes = std::env::var("DATA_STUDIO_STAGING_RESUME_FREE_BYTES")
+            .unwrap_or_else(|_| "2147483648".to_string())
+            .parse::<u64>()
+            .context("DATA_STUDIO_STAGING_RESUME_FREE_BYTES must be a valid u64")?;
         let host = std::env::var("DATA_STUDIO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = std::env::var("DATA_STUDIO_PORT")
             .unwrap_or_else(|_| "8080".to_string())
@@ -38,6 +48,8 @@ impl AppConfig {
             workspace_dir,
             data_dir,
             temp_dir,
+            staging_pause_free_bytes,
+            staging_resume_free_bytes,
             host,
             port,
         })

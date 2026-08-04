@@ -56,6 +56,8 @@ Allow media to enter the system reliably.
 
 Media can be imported and tracked through the ingestion pipeline.
 
+Status: complete.
+
 ---
 
 # Phase 2 — Audio Processing

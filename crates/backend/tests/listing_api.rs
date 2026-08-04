@@ -7,7 +7,7 @@ use axum::{
 use backend::{db::Database, job::JobType, migrations, server::AppState, source::SourceType};
 use serde_json::Value;
 use sqlx::PgPool;
-use std::env;
+use std::{env, path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -142,7 +142,15 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
         .await
         .unwrap();
 
-    let app = backend::http::router(AppState { database });
+    let app = backend::http::router(AppState {
+        database,
+        staging_dir: PathBuf::from("/tmp"),
+        staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
+            1,
+            2,
+            backend::worker::DefaultFilesystemMetrics,
+        )),
+    });
 
     let response = app
         .clone()
@@ -298,7 +306,15 @@ async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
     .await
     .unwrap();
 
-    let app = backend::http::router(AppState { database });
+    let app = backend::http::router(AppState {
+        database,
+        staging_dir: PathBuf::from("/tmp"),
+        staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
+            1,
+            2,
+            backend::worker::DefaultFilesystemMetrics,
+        )),
+    });
 
     let response = app
         .clone()
@@ -345,4 +361,36 @@ async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn staging_capacity_endpoint_reports_guard_state() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let database = Database::from_pool(pool);
+    let app = backend::http::router(AppState {
+        database,
+        staging_dir: PathBuf::from("/tmp"),
+        staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
+            1,
+            2,
+            backend::worker::DefaultFilesystemMetrics,
+        )),
+    });
+
+    let response = app
+        .oneshot(
+            Request::get("/staging/capacity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let capacity: Value = serde_json::from_slice(&body).unwrap();
+    assert!(capacity["free_bytes"].as_u64().is_some());
+    assert!(capacity["total_bytes"].as_u64().is_some());
 }

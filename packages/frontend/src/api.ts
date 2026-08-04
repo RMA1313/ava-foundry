@@ -40,6 +40,16 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!response.ok) {
+    let message: string | null = null;
+    try {
+      const body = (await response.json()) as { error?: { message?: string } };
+      message = body.error?.message ?? null;
+    } catch {
+      // Fall back to the HTTP status when the response body is not JSON.
+    }
+    if (message) {
+      throw new Error(message);
+    }
     throw new Error(`request failed: ${response.status}`);
   }
   return (await response.json()) as T;

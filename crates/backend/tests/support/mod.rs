@@ -4,6 +4,8 @@ pub fn clear_env() {
         "DATA_STUDIO_WORKSPACE_DIR",
         "DATA_STUDIO_DATA_DIR",
         "DATA_STUDIO_TEMP_DIR",
+        "DATA_STUDIO_STAGING_PAUSE_FREE_BYTES",
+        "DATA_STUDIO_STAGING_RESUME_FREE_BYTES",
         "DATA_STUDIO_HOST",
         "DATA_STUDIO_PORT",
     ] {

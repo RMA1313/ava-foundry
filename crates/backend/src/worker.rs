@@ -12,6 +12,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{Duration, Utc};
 use tokio::{sync::Semaphore, task::JoinSet};
+use tracing::info;
 
 use crate::{
     download::DownloadCommandAdapter,
@@ -38,6 +39,107 @@ pub trait JobHandler: Send + Sync + 'static {
     fn handle(&self, job: Job, state: AppState) -> HandlerFuture;
 }
 
+pub trait FilesystemMetrics: Send + Sync + 'static {
+    fn free_bytes(&self, path: &Path) -> Result<u64>;
+    fn total_bytes(&self, path: &Path) -> Result<u64>;
+}
+
+#[derive(Debug, Default)]
+pub struct DefaultFilesystemMetrics;
+
+impl FilesystemMetrics for DefaultFilesystemMetrics {
+    fn free_bytes(&self, path: &Path) -> Result<u64> {
+        filesystem_bytes(path).map(|(free, _)| free)
+    }
+
+    fn total_bytes(&self, path: &Path) -> Result<u64> {
+        filesystem_bytes(path).map(|(_, total)| total)
+    }
+}
+
+#[derive(Clone)]
+pub struct StagingCapacityGuard {
+    pause_free_bytes: u64,
+    resume_free_bytes: u64,
+    metrics: Arc<dyn FilesystemMetrics>,
+    paused: Arc<AtomicBool>,
+}
+
+impl StagingCapacityGuard {
+    pub fn new(
+        pause_free_bytes: u64,
+        resume_free_bytes: u64,
+        metrics: impl FilesystemMetrics,
+    ) -> Self {
+        Self {
+            pause_free_bytes,
+            resume_free_bytes,
+            metrics: Arc::new(metrics),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn check(&self, path: &Path) -> Result<StagingCapacityState> {
+        let free_bytes = self.metrics.free_bytes(path)?;
+        let total_bytes = self.metrics.total_bytes(path)?;
+        let currently_paused = self.paused.load(Ordering::SeqCst);
+        let next_paused = if currently_paused {
+            free_bytes < self.resume_free_bytes
+        } else {
+            free_bytes < self.pause_free_bytes
+        };
+        self.paused.store(next_paused, Ordering::SeqCst);
+        Ok(StagingCapacityState {
+            paused: next_paused,
+            free_bytes,
+            total_bytes,
+            pause_free_bytes: self.pause_free_bytes,
+            resume_free_bytes: self.resume_free_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingCapacityState {
+    pub paused: bool,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    pub pause_free_bytes: u64,
+    pub resume_free_bytes: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_bytes(path: &Path) -> Result<(u64, u64)> {
+    use std::process::Command;
+    let output = Command::new("df").arg("-Pk").arg(path).output()?;
+    if !output.status.success() {
+        return Err(anyhow!("failed to read filesystem capacity"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .nth(1)
+        .ok_or_else(|| anyhow!("failed to parse filesystem capacity"))?;
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 6 {
+        return Err(anyhow!("failed to parse filesystem capacity"));
+    }
+    let total_kib = fields[1].parse::<u64>()?;
+    let avail_kib = fields[3].parse::<u64>()?;
+    Ok((avail_kib * 1024, total_kib * 1024))
+}
+
+#[cfg(not(unix))]
+fn filesystem_bytes(_path: &Path) -> Result<(u64, u64)> {
+    Err(anyhow!(
+        "filesystem metrics are unsupported on this platform"
+    ))
+}
+
 impl<F, Fut> JobHandler for F
 where
     F: Fn(Job, AppState) -> Fut + Send + Sync + 'static,
@@ -55,6 +157,8 @@ pub struct WorkerRuntime {
     lease_duration: Duration,
     max_attempts: i32,
     concurrency_limit: usize,
+    staging_dir: Option<PathBuf>,
+    staging_capacity_guard: Option<StagingCapacityGuard>,
     handlers: Arc<HashMap<JobType, Arc<dyn JobHandler>>>,
 }
 
@@ -66,6 +170,8 @@ impl WorkerRuntime {
             lease_duration: Duration::minutes(5),
             max_attempts: 3,
             concurrency_limit: 1,
+            staging_dir: None,
+            staging_capacity_guard: None,
             handlers: Arc::new(HashMap::new()),
         }
     }
@@ -94,6 +200,16 @@ impl WorkerRuntime {
 
     pub fn with_max_attempts(mut self, max_attempts: i32) -> Self {
         self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    pub fn with_staging_capacity_guard(
+        mut self,
+        staging_dir: impl Into<PathBuf>,
+        guard: StagingCapacityGuard,
+    ) -> Self {
+        self.staging_dir = Some(staging_dir.into());
+        self.staging_capacity_guard = Some(guard);
         self
     }
 
@@ -141,6 +257,21 @@ impl WorkerRuntime {
         semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         while semaphore.available_permits() > 0 {
+            if let (Some(staging_dir), Some(guard)) =
+                (&self.staging_dir, &self.staging_capacity_guard)
+            {
+                let capacity = guard.check(staging_dir)?;
+                if capacity.paused {
+                    info!(
+                        free_bytes = capacity.free_bytes,
+                        total_bytes = capacity.total_bytes,
+                        pause_free_bytes = capacity.pause_free_bytes,
+                        resume_free_bytes = capacity.resume_free_bytes,
+                        "staging capacity guard paused new claims"
+                    );
+                    break;
+                }
+            }
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => break,
@@ -399,9 +530,42 @@ mod tests {
     };
     use chrono::Utc;
     use sqlx::PgPool;
-    use std::env;
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        sync::atomic::AtomicU64,
+    };
     use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct FakeFilesystemMetrics {
+        free_bytes: Arc<AtomicU64>,
+        total_bytes: Arc<AtomicU64>,
+    }
+
+    impl FakeFilesystemMetrics {
+        fn new(free_bytes: u64, total_bytes: u64) -> Self {
+            Self {
+                free_bytes: Arc::new(AtomicU64::new(free_bytes)),
+                total_bytes: Arc::new(AtomicU64::new(total_bytes)),
+            }
+        }
+
+        fn set_free_bytes(&self, free_bytes: u64) {
+            self.free_bytes.store(free_bytes, Ordering::SeqCst);
+        }
+    }
+
+    impl FilesystemMetrics for FakeFilesystemMetrics {
+        fn free_bytes(&self, _path: &Path) -> Result<u64> {
+            Ok(self.free_bytes.load(Ordering::SeqCst))
+        }
+
+        fn total_bytes(&self, _path: &Path) -> Result<u64> {
+            Ok(self.total_bytes.load(Ordering::SeqCst))
+        }
+    }
 
     async fn test_pool() -> PgPool {
         let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
@@ -485,6 +649,12 @@ mod tests {
             .execute_job(
                 AppState {
                     database: database.clone(),
+                    staging_dir: PathBuf::from("/tmp/staging"),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
                 },
                 Arc::new(HashMap::new()),
                 job.clone(),
@@ -551,9 +721,38 @@ mod tests {
         );
         let handlers = runtime.handlers.clone();
         runtime
-            .execute_job(AppState { database }, handlers, job.clone())
+            .execute_job(
+                AppState {
+                    database,
+                    staging_dir: PathBuf::from("/tmp/staging"),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                job.clone(),
+            )
             .await
             .expect("dispatch should succeed");
         assert_eq!(*calls.lock().await, 1);
+    }
+
+    #[test]
+    fn staging_capacity_guard_uses_hysteresis() {
+        let metrics = FakeFilesystemMetrics::new(5, 10);
+        let guard = StagingCapacityGuard::new(6, 8, metrics.clone());
+
+        let first = guard.check(Path::new("/tmp")).expect("capacity check");
+        assert!(first.paused);
+
+        metrics.set_free_bytes(7);
+        let second = guard.check(Path::new("/tmp")).expect("capacity check");
+        assert!(second.paused);
+
+        metrics.set_free_bytes(9);
+        let third = guard.check(Path::new("/tmp")).expect("capacity check");
+        assert!(!third.paused);
     }
 }

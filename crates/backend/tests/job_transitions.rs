@@ -271,3 +271,41 @@ async fn lease_recovery_requeues_expired_jobs() {
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].status, JobStatus::Queued);
 }
+
+#[tokio::test]
+async fn startup_recovery_is_idempotent() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool).await;
+    let source_id = seed_source(&pool, project_id).await;
+    let repository = JobRepository::new(pool.clone());
+
+    let created = repository
+        .create(
+            project_id,
+            Some(source_id),
+            JobType::AudioExtraction,
+            1,
+            Utc::now(),
+        )
+        .await
+        .expect("job should be created");
+    repository
+        .claim_next("worker-a", Utc::now() - Duration::minutes(1))
+        .await
+        .expect("claim should succeed")
+        .expect("a job should be claimable");
+
+    let first = repository
+        .recover_expired_leases(Utc::now())
+        .await
+        .expect("recovery should succeed");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].id, created.id);
+
+    let second = repository
+        .recover_expired_leases(Utc::now())
+        .await
+        .expect("recovery should succeed again");
+    assert!(second.is_empty());
+}

@@ -7,11 +7,14 @@ use backend::{
     migrations,
     server::AppState,
     source::SourceType,
-    worker::{media_ingestion_handler, JobHandler, WorkerRuntime},
+    worker::{
+        media_ingestion_handler, DefaultFilesystemMetrics, JobHandler, StagingCapacityGuard,
+        WorkerRuntime,
+    },
 };
 use chrono::Utc;
 use sqlx::PgPool;
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, sync::Arc};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -118,7 +121,11 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
             ),
         )
         .with_poll_interval(std::time::Duration::from_millis(5));
-    let state = AppState { database };
+    let state = AppState {
+        database,
+        staging_dir: temp_dir.path().to_path_buf(),
+        staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let run = tokio::spawn(async move {
         runtime
@@ -231,7 +238,11 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
         temp_dir.path(),
         backend::download::DownloadCommandAdapter::new(executable).unwrap(),
     );
-    let state = AppState { database };
+    let state = AppState {
+        database,
+        staging_dir: temp_dir.path().to_path_buf(),
+        staging_capacity_guard: Arc::new(StagingCapacityGuard::new(1, 2, DefaultFilesystemMetrics)),
+    };
 
     let first = handler
         .handle(job.clone(), state.clone())
