@@ -20,6 +20,7 @@ use tracing::info;
 use crate::{
     config::AudioNormalizationProfile,
     download::DownloadCommandAdapter,
+    duplicate::DuplicateDecisionUpsert,
     ffmpeg::FfmpegAdapter,
     ffprobe::{FfprobeAdapter, FfprobeOutput},
     fingerprint::FingerprintAdapter,
@@ -1364,6 +1365,122 @@ mod tests {
             .unwrap();
         assert_eq!(fingerprints.len(), 1);
         let _ = job;
+    }
+
+    #[tokio::test]
+    async fn fingerprint_worker_persists_duplicate_decisions_and_groups_idempotently() {
+        let pool = test_pool().await;
+        ensure_fingerprint_tables(&pool).await;
+        let (project_id, audio_asset_id) = seed_finalized_audio_asset(&pool).await;
+        let (_other_project_id, duplicate_audio_asset_id) = seed_finalized_audio_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = TempDir::new().unwrap();
+        let fingerprint_root = temp_dir.path().join("audio");
+        let fingerprint_tmp_root = temp_dir.path().join("audio-tmp");
+        fs::create_dir_all(&fingerprint_root).unwrap();
+        fs::create_dir_all(&fingerprint_tmp_root).unwrap();
+        let audio_path = PathBuf::from("/tmp/audio/audio-assets/final.flac");
+        fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+        fs::write(&audio_path, b"final-audio").unwrap();
+        let fingerprint_executable = fake_fingerprint(&temp_dir, "fingerprint:1");
+        let duplicate_fingerprint_path = PathBuf::from("/tmp/audio/audio-fingerprints/existing.fp");
+        if let Some(parent) = duplicate_fingerprint_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&duplicate_fingerprint_path, b"existing").unwrap();
+        sqlx::query(
+            r#"
+            insert into audio_fingerprints (
+                id, audio_asset_id, algorithm, algorithm_version, processing_status,
+                duration_seconds, storage_path, created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(duplicate_audio_asset_id)
+        .bind("local-fingerprint")
+        .bind("1")
+        .bind("completed")
+        .bind(3.0_f64)
+        .bind(duplicate_fingerprint_path.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let _job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(audio_asset_id),
+                JobType::DuplicateDetection,
+                0,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let claimed = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        handle_fingerprint_job(
+            &AppState {
+                database: database.clone(),
+                staging_dir: temp_dir.path().to_path_buf(),
+                audio_storage: AudioStorageConfig::new(
+                    fingerprint_root.clone(),
+                    fingerprint_tmp_root.clone(),
+                ),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            },
+            claimed.clone(),
+            &fingerprint_executable,
+        )
+        .await
+        .expect("duplicate job should run");
+        handle_fingerprint_job(
+            &AppState {
+                database: database.clone(),
+                staging_dir: temp_dir.path().to_path_buf(),
+                audio_storage: AudioStorageConfig::new(
+                    fingerprint_root.clone(),
+                    fingerprint_tmp_root.clone(),
+                ),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            },
+            claimed,
+            &fingerprint_executable,
+        )
+        .await
+        .expect("repeat duplicate job should be idempotent");
+        let decisions =
+            sqlx::query_scalar::<_, i64>("select count(*) from audio_duplicate_decisions")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(decisions, 1);
+        let groups = sqlx::query_scalar::<_, i64>("select count(*) from duplicate_groups")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(groups, 1);
+        let memberships =
+            sqlx::query_scalar::<_, i64>("select count(*) from duplicate_group_memberships")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(memberships, 2);
     }
 
     fn fake_ffprobe(dir: &TempDir, json: &str) -> PathBuf {
@@ -2909,27 +3026,97 @@ async fn handle_fingerprint_job(
     }
     let algorithm = "local-fingerprint";
     let algorithm_version = "1";
-    if let Some(existing) = state
+    let existing = state
         .database
         .audio_fingerprints()
         .get_by_asset_algorithm_version(audio_asset.id, algorithm, algorithm_version)
-        .await?
-    {
+        .await?;
+    let fingerprint = if let Some(existing) = existing {
         if existing.processing_status == "completed" {
-            return Ok(JobOutcome::Completed);
+            existing
+        } else {
+            match run_fingerprint_generation(
+                state,
+                audio_asset.id,
+                &audio_asset.storage_path,
+                audio_asset.duration_seconds,
+                algorithm,
+                algorithm_version,
+                fingerprint_path,
+            )
+            .await
+            {
+                Ok(fingerprint) => fingerprint,
+                Err(err) => {
+                    return Ok(JobOutcome::Retry {
+                        failure_reason: err.to_string(),
+                        retry_after: Utc::now() + chrono::Duration::minutes(5),
+                    })
+                }
+            }
         }
-    }
-    let adapter = match FingerprintAdapter::new(fingerprint_path) {
-        Ok(adapter) => adapter,
-        Err(err) => {
-            return Ok(JobOutcome::Retry {
-                failure_reason: err.to_string(),
-                retry_after: Utc::now() + chrono::Duration::minutes(5),
-            })
+    } else {
+        match run_fingerprint_generation(
+            state,
+            audio_asset.id,
+            &audio_asset.storage_path,
+            audio_asset.duration_seconds,
+            algorithm,
+            algorithm_version,
+            fingerprint_path,
+        )
+        .await
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                return Ok(JobOutcome::Retry {
+                    failure_reason: err.to_string(),
+                    retry_after: Utc::now() + chrono::Duration::minutes(5),
+                })
+            }
         }
     };
+    run_duplicate_detection(state, &audio_asset, &fingerprint).await?;
+    let output_bytes = tokio::fs::metadata(&fingerprint.storage_path).await?.len() as i64;
+    record_stage_run(
+        &state.database,
+        StageRun {
+            id: Uuid::new_v4(),
+            project_id: audio_asset.project_id,
+            media_asset_id: Some(audio_asset.media_asset_id),
+            audio_asset_id: Some(audio_asset.id),
+            job_id: Some(job.id),
+            stage_name: "duplicate_detection".to_string(),
+            status: "completed".to_string(),
+            queue_wait_ms: queue_wait_ms(queued_at),
+            wall_time_ms: started.elapsed().as_millis() as i64,
+            input_bytes: audio_asset.byte_size,
+            output_bytes,
+            input_duration_seconds: audio_asset.duration_seconds,
+            throughput: throughput(audio_asset.duration_seconds, started),
+            failure_reason: None,
+            cpu_percent: optional_cpu_percent(),
+            memory_bytes: optional_memory_bytes(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    )
+    .await?;
+    Ok(JobOutcome::Completed)
+}
+
+async fn run_fingerprint_generation(
+    state: &AppState,
+    audio_asset_id: Uuid,
+    audio_storage_path: &str,
+    duration_seconds: f64,
+    algorithm: &str,
+    algorithm_version: &str,
+    fingerprint_path: &Path,
+) -> Result<crate::audio_fingerprint::AudioFingerprint> {
+    let adapter = FingerprintAdapter::new(fingerprint_path)?;
     let temporary_path = state.audio_storage.temporary_fingerprint_path(
-        audio_asset.id,
+        audio_asset_id,
         algorithm,
         algorithm_version,
     )?;
@@ -2944,17 +3131,17 @@ async fn handle_fingerprint_job(
             state.database.pool(),
             crate::audio_fingerprint::AudioFingerprintUpsert {
                 id: Uuid::new_v4(),
-                audio_asset_id: audio_asset.id,
+                audio_asset_id,
                 algorithm: algorithm.to_string(),
                 algorithm_version: algorithm_version.to_string(),
                 processing_status: "running".to_string(),
-                duration_seconds: audio_asset.duration_seconds,
+                duration_seconds,
                 storage_path: temporary_path.to_string_lossy().to_string(),
             },
         )
         .await?;
     let mut process = adapter
-        .start(Path::new(&audio_asset.storage_path), &temporary_path)
+        .start(Path::new(audio_storage_path), &temporary_path)
         .await?;
     while let Some(_line) = process.next_stdout().await {}
     let output = process.wait().await?;
@@ -2967,70 +3154,147 @@ async fn handle_fingerprint_job(
                 state.database.pool(),
                 crate::audio_fingerprint::AudioFingerprintUpsert {
                     id: Uuid::new_v4(),
-                    audio_asset_id: audio_asset.id,
+                    audio_asset_id,
                     algorithm: algorithm.to_string(),
                     algorithm_version: algorithm_version.to_string(),
                     processing_status: "failed".to_string(),
-                    duration_seconds: audio_asset.duration_seconds,
+                    duration_seconds,
                     storage_path: temporary_path.to_string_lossy().to_string(),
                 },
             )
             .await?;
-        return Ok(JobOutcome::Retry {
-            failure_reason: "fingerprint executable failed".to_string(),
-            retry_after: Utc::now() + chrono::Duration::minutes(5),
-        });
+        return Err(anyhow!("fingerprint executable failed"));
     }
     let byte_size = tokio::fs::metadata(&temporary_path).await?.len() as i64;
     let final_path = state.audio_storage.finalize_fingerprint_path(
         &temporary_path,
-        audio_asset.id,
+        audio_asset_id,
         algorithm,
         algorithm_version,
         byte_size,
     )?;
-    let fingerprint = state
+    state
         .database
         .audio_fingerprints()
         .upsert(
             state.database.pool(),
             crate::audio_fingerprint::AudioFingerprintUpsert {
                 id: Uuid::new_v4(),
-                audio_asset_id: audio_asset.id,
+                audio_asset_id,
                 algorithm: algorithm.to_string(),
                 algorithm_version: algorithm_version.to_string(),
                 processing_status: "completed".to_string(),
-                duration_seconds: audio_asset.duration_seconds,
+                duration_seconds,
                 storage_path: final_path.to_string_lossy().to_string(),
             },
         )
+        .await
+}
+
+async fn run_duplicate_detection(
+    state: &AppState,
+    audio_asset: &crate::audio_asset::AudioAsset,
+    fingerprint: &crate::audio_fingerprint::AudioFingerprint,
+) -> Result<()> {
+    const DURATION_TOLERANCE_SECONDS: f64 = 1.0;
+    const DUPLICATE_SIMILARITY_THRESHOLD: f64 = 0.98;
+    let candidates = state
+        .database
+        .audio_fingerprints()
+        .list_searchable_index(&fingerprint.algorithm, &fingerprint.algorithm_version)
         .await?;
-    record_stage_run(
-        &state.database,
-        StageRun {
-            id: Uuid::new_v4(),
-            project_id: audio_asset.project_id,
-            media_asset_id: Some(audio_asset.media_asset_id),
-            audio_asset_id: Some(audio_asset.id),
-            job_id: Some(job.id),
-            stage_name: "duplicate_detection".to_string(),
-            status: "completed".to_string(),
-            queue_wait_ms: queue_wait_ms(queued_at),
-            wall_time_ms: started.elapsed().as_millis() as i64,
-            input_bytes: audio_asset.byte_size,
-            output_bytes: byte_size,
-            input_duration_seconds: audio_asset.duration_seconds,
-            throughput: throughput(audio_asset.duration_seconds, started),
-            failure_reason: None,
-            cpu_percent: optional_cpu_percent(),
-            memory_bytes: optional_memory_bytes(),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        },
-    )
-    .await?;
-    let _ = fingerprint;
-    Ok(JobOutcome::Completed)
+    for candidate in candidates.into_iter().filter(|candidate| {
+        candidate.audio_asset_id != audio_asset.id
+            && (candidate.duration_seconds - audio_asset.duration_seconds).abs()
+                <= DURATION_TOLERANCE_SECONDS
+    }) {
+        let duration_delta_seconds =
+            (audio_asset.duration_seconds - candidate.duration_seconds).abs();
+        let similarity_score =
+            (1.0 - duration_delta_seconds / DURATION_TOLERANCE_SECONDS).clamp(0.0, 1.0);
+        let decision = if similarity_score >= DUPLICATE_SIMILARITY_THRESHOLD {
+            "duplicate"
+        } else {
+            "not_duplicate"
+        };
+        let confidence = if similarity_score >= 0.995 {
+            "high"
+        } else if similarity_score >= 0.99 {
+            "medium"
+        } else {
+            "low"
+        };
+        let (
+            audio_asset_low_id,
+            audio_asset_high_id,
+            candidate_fingerprint_low_id,
+            candidate_fingerprint_high_id,
+        ) = ordered_pair(
+            audio_asset.id,
+            candidate.audio_asset_id,
+            fingerprint.id,
+            candidate.id,
+        );
+        let duplicate_group_id = if decision == "duplicate" {
+            Some(
+                state
+                    .database
+                    .duplicates()
+                    .ensure_group_membership(
+                        audio_asset.project_id,
+                        [audio_asset.id, candidate.audio_asset_id],
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let _ = state
+            .database
+            .duplicates()
+            .upsert_decision(
+                state.database.pool(),
+                DuplicateDecisionUpsert {
+                    id: Uuid::new_v4(),
+                    audio_asset_low_id,
+                    audio_asset_high_id,
+                    candidate_fingerprint_low_id,
+                    candidate_fingerprint_high_id,
+                    algorithm: fingerprint.algorithm.clone(),
+                    algorithm_version: fingerprint.algorithm_version.clone(),
+                    duration_delta_seconds,
+                    similarity_score,
+                    decision: decision.to_string(),
+                    confidence: confidence.to_string(),
+                    duplicate_group_id,
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn ordered_pair(
+    left_audio_asset_id: Uuid,
+    right_audio_asset_id: Uuid,
+    left_fingerprint_id: Uuid,
+    right_fingerprint_id: Uuid,
+) -> (Uuid, Uuid, Uuid, Uuid) {
+    if left_audio_asset_id <= right_audio_asset_id {
+        (
+            left_audio_asset_id,
+            right_audio_asset_id,
+            left_fingerprint_id,
+            right_fingerprint_id,
+        )
+    } else {
+        (
+            right_audio_asset_id,
+            left_audio_asset_id,
+            right_fingerprint_id,
+            left_fingerprint_id,
+        )
+    }
 }
 
 fn queue_wait_ms(available_at: chrono::DateTime<Utc>) -> i64 {

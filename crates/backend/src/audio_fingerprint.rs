@@ -125,6 +125,7 @@ impl AudioFingerprintRepository {
             from audio_fingerprints
             where algorithm = $1
               and algorithm_version = $2
+              and processing_status = 'completed'
             order by created_at asc, id asc
             "#,
         )

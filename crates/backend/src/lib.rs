@@ -3,6 +3,7 @@ pub mod audio_fingerprint;
 pub mod config;
 pub mod db;
 pub mod download;
+pub mod duplicate;
 pub mod ffmpeg;
 pub mod ffprobe;
 pub mod fingerprint;

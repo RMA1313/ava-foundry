@@ -65,6 +65,8 @@ Maintain the searchable fingerprint index.
 
 Find nearest fingerprint candidates.
 
+Duplicate search only considers completed fingerprints from the indexed search set and narrows candidates by deterministic metadata filters before scoring.
+
 ---
 
 ## P3-06 — Similarity Evaluation
@@ -72,6 +74,8 @@ Find nearest fingerprint candidates.
 ### Goal
 
 Compute similarity scores and determine duplicate confidence.
+
+Similarity scoring is deterministic and based on persisted fingerprint metadata.
 
 ---
 
@@ -81,6 +85,8 @@ Compute similarity scores and determine duplicate confidence.
 
 Persist deterministic duplicate decisions.
 
+Duplicate decisions are idempotent and survive retries without changing prior outcomes.
+
 ---
 
 ## P3-08 — Duplicate Groups
@@ -88,6 +94,8 @@ Persist deterministic duplicate decisions.
 ### Goal
 
 Maintain duplicate groups and their membership.
+
+Duplicate group membership is created and merged idempotently without selecting a canonical asset yet.
 
 ---
 
