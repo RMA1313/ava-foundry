@@ -26,6 +26,37 @@ pub struct DuplicateRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGroup {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub canonical_audio_asset_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGroupMember {
+    pub duplicate_group_id: Uuid,
+    pub audio_asset_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGroupDetails {
+    pub group: DuplicateGroup,
+    pub members: Vec<DuplicateGroupMember>,
+    pub decisions: Vec<DuplicateDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGroupPage {
+    pub items: Vec<DuplicateGroupDetails>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 impl DuplicateRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -176,6 +207,170 @@ impl DuplicateRepository {
         }
         tx.commit().await?;
         Ok(target_group_id)
+    }
+
+    pub async fn ensure_canonical_audio_asset(
+        &self,
+        duplicate_group_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            r#"
+            select canonical_audio_asset_id
+            from duplicate_groups
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(duplicate_group_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = existing else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let current: Option<Uuid> = row.try_get("canonical_audio_asset_id")?;
+        if current.is_some() {
+            tx.commit().await?;
+            return Ok(current);
+        }
+        let canonical = sqlx::query_scalar(
+            r#"
+            select audio_asset_id
+            from duplicate_group_memberships
+            where duplicate_group_id = $1
+            order by audio_asset_id asc
+            limit 1
+            "#,
+        )
+        .bind(duplicate_group_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(canonical_audio_asset_id) = canonical {
+            sqlx::query(
+                r#"
+                update duplicate_groups
+                set canonical_audio_asset_id = $1, updated_at = now()
+                where id = $2
+                  and canonical_audio_asset_id is null
+                "#,
+            )
+            .bind(canonical_audio_asset_id)
+            .bind(duplicate_group_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Some(canonical_audio_asset_id));
+        }
+        tx.commit().await?;
+        Ok(None)
+    }
+
+    pub async fn recover_canonical_audio_assets(&self) -> Result<Vec<(Uuid, Uuid)>> {
+        let group_ids = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            select id
+            from duplicate_groups
+            where canonical_audio_asset_id is null
+            order by created_at asc, id asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recovered = Vec::new();
+        for group_id in group_ids {
+            if let Some(canonical_audio_asset_id) =
+                self.ensure_canonical_audio_asset(group_id).await?
+            {
+                recovered.push((group_id, canonical_audio_asset_id));
+            }
+        }
+        Ok(recovered)
+    }
+
+    pub async fn list_groups(
+        &self,
+        project_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<DuplicateGroupPage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let group_rows = sqlx::query(
+            r#"
+            select id, project_id, canonical_audio_asset_id, created_at, updated_at
+            from duplicate_groups
+            where project_id = $1
+            order by created_at asc, id asc
+            limit $2 offset $3
+            "#,
+        )
+        .bind(project_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(group_rows.len());
+        for row in group_rows {
+            let group = DuplicateGroup {
+                id: row.try_get("id")?,
+                project_id: row.try_get("project_id")?,
+                canonical_audio_asset_id: row.try_get("canonical_audio_asset_id")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            };
+            let member_rows = sqlx::query(
+                r#"
+                select duplicate_group_id, audio_asset_id, created_at, updated_at
+                from duplicate_group_memberships
+                where duplicate_group_id = $1
+                order by audio_asset_id asc
+                "#,
+            )
+            .bind(group.id)
+            .fetch_all(&self.pool)
+            .await?;
+            let members = member_rows
+                .into_iter()
+                .map(|row| {
+                    Ok(DuplicateGroupMember {
+                        duplicate_group_id: row.try_get("duplicate_group_id")?,
+                        audio_asset_id: row.try_get("audio_asset_id")?,
+                        created_at: row.try_get("created_at")?,
+                        updated_at: row.try_get("updated_at")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let decision_rows = sqlx::query(
+                r#"
+                select id, audio_asset_low_id, audio_asset_high_id,
+                       candidate_fingerprint_low_id, candidate_fingerprint_high_id,
+                       algorithm, algorithm_version, duration_delta_seconds,
+                       similarity_score, decision, confidence, duplicate_group_id,
+                       created_at, updated_at
+                from audio_duplicate_decisions
+                where duplicate_group_id = $1
+                order by created_at asc, id asc
+                "#,
+            )
+            .bind(group.id)
+            .fetch_all(&self.pool)
+            .await?;
+            let decisions = decision_rows
+                .iter()
+                .map(duplicate_decision_from_row)
+                .collect::<Result<Vec<_>>>()?;
+            items.push(DuplicateGroupDetails {
+                group,
+                members,
+                decisions,
+            });
+        }
+        Ok(DuplicateGroupPage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+        })
     }
 }
 

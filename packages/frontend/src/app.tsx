@@ -4,8 +4,10 @@ import {
   fetchLiveness,
   fetchProjects,
   fetchProjectAudioAssets,
+  fetchProjectDuplicateGroups,
   fetchProjectMetricsSummary,
   type AudioAsset,
+  type DuplicateGroup,
   type Project,
   type StageRun,
 } from "./api";
@@ -20,8 +22,10 @@ function DashboardPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>("");
   const [audioAssets, setAudioAssets] = useState<AudioAsset[] | null>(null);
+  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[] | null>(null);
   const [stageRuns, setStageRuns] = useState<StageRun[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -29,11 +33,13 @@ function DashboardPage() {
   );
 
   async function refreshProjectData(projectId: string) {
-    const [nextAssets, nextRuns] = await Promise.all([
+    const [nextAssets, nextGroups, nextRuns] = await Promise.all([
       fetchProjectAudioAssets(baseUrl, projectId),
+      fetchProjectDuplicateGroups(baseUrl, projectId),
       fetchProjectMetricsSummary(baseUrl, projectId),
     ]);
     setAudioAssets(nextAssets);
+    setDuplicateGroups(nextGroups);
     setStageRuns(nextRuns);
     setError(null);
   }
@@ -58,19 +64,31 @@ function DashboardPage() {
   useEffect(() => {
     if (!selectedProjectId) {
       setAudioAssets(null);
+      setDuplicateGroups(null);
       setStageRuns(null);
       return;
     }
     let cancelled = false;
     setAudioAssets(null);
+    setDuplicateGroups(null);
     setStageRuns(null);
-    refreshProjectData(selectedProjectId).catch(() => {
-      if (!cancelled) setError("API error while loading audio assets.");
-    });
-    const interval = window.setInterval(() => {
-      refreshProjectData(selectedProjectId).catch(() => {
-        if (!cancelled) setError("API error while refreshing audio assets.");
+    setRefreshing(true);
+    refreshProjectData(selectedProjectId)
+      .catch(() => {
+        if (!cancelled) setError("API error while loading duplicate groups.");
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshing(false);
       });
+    const interval = window.setInterval(() => {
+      setRefreshing(true);
+      refreshProjectData(selectedProjectId)
+        .catch(() => {
+          if (!cancelled) setError("API error while refreshing duplicate groups.");
+        })
+        .finally(() => {
+          if (!cancelled) setRefreshing(false);
+        });
     }, 5000);
     return () => {
       cancelled = true;
@@ -110,6 +128,7 @@ function DashboardPage() {
       </section>
 
       {error ? <section><strong>{error}</strong></section> : null}
+      {refreshing ? <section><p>Refreshing duplicate groups...</p></section> : null}
 
       <section style={{ marginBottom: 24 }}>
         <h2>Audio Assets</h2>
@@ -135,6 +154,44 @@ function DashboardPage() {
                 <div>Validation: {asset.validation_status ?? "unknown"}</div>
                 {asset.validation_error ? <div style={{ color: "#b91c1c" }}>Failure: {asset.validation_error}</div> : null}
                 {asset.normalization_profile ? <div>Profile: {asset.normalization_profile}</div> : null}
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section style={{ marginBottom: 24 }}>
+        <h2>Duplicate Groups</h2>
+        {duplicateGroups === null ? (
+          <p>Loading duplicate groups...</p>
+        ) : duplicateGroups.length === 0 ? (
+          <p>No duplicate groups yet.</p>
+        ) : (
+          <div style={{ display: "grid", gap: 16 }}>
+            {duplicateGroups.map((group) => (
+              <article key={group.id} style={{ padding: 16, border: "1px solid #cbd5e1", borderRadius: 12, background: "white" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <strong>{group.id}</strong>
+                  {badge(group.canonical_audio_asset_id ? "canonical set" : "canonical pending")}
+                </div>
+                <div>Canonical Audio Asset: {group.canonical_audio_asset_id ?? "pending"}</div>
+                <div>
+                  Members:{" "}
+                  {group.members.map((member) => member.audio_asset_id).join(", ")}
+                </div>
+                <div>
+                  Decisions: {group.decisions.length}
+                </div>
+                {group.decisions.map((decision) => (
+                  <div key={decision.id} style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #e2e8f0" }}>
+                    <div>
+                      {decision.audio_asset_low_id} vs {decision.audio_asset_high_id}
+                    </div>
+                    <div>
+                      {decision.decision} {badge(decision.confidence)} score {decision.similarity_score}
+                    </div>
+                  </div>
+                ))}
               </article>
             ))}
           </div>

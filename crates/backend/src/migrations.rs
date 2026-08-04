@@ -56,9 +56,18 @@ pub async fn run(database_url: &str) -> Result<()> {
         create table if not exists duplicate_groups (
             id uuid primary key,
             project_id uuid not null references projects(id) on delete restrict,
+            canonical_audio_asset_id uuid references audio_assets(id) on delete set null,
             created_at timestamptz not null default now(),
             updated_at timestamptz not null default now()
         )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        alter table if exists duplicate_groups
+            add column if not exists canonical_audio_asset_id uuid references audio_assets(id) on delete set null
         "#,
     )
     .execute(&pool)

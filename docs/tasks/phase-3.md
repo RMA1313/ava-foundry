@@ -105,6 +105,8 @@ Duplicate group membership is created and merged idempotently without selecting 
 
 Select one canonical Audio Asset for each duplicate group.
 
+Canonical selection is persisted on the duplicate group itself and is chosen deterministically from the sorted group members.
+
 ---
 
 ## P3-10 — Recovery
@@ -112,6 +114,8 @@ Select one canonical Audio Asset for each duplicate group.
 ### Goal
 
 Recover interrupted deduplication safely.
+
+Recovery replays missing canonical selection from persisted duplicate-group membership without changing existing canonical assignments.
 
 ---
 
@@ -121,6 +125,8 @@ Recover interrupted deduplication safely.
 
 Expose duplicate groups and canonical relationships.
 
+The API returns duplicate groups, members, decisions, and canonical Audio Asset relationships with project-scoped, deterministic ordering.
+
 ---
 
 ## P3-12 — Duplicate Dashboard
@@ -128,6 +134,8 @@ Expose duplicate groups and canonical relationships.
 ### Goal
 
 Display duplicate processing and review information.
+
+The dashboard renders duplicate-group loading, empty, error, and polling states alongside canonical membership details.
 
 ---
 

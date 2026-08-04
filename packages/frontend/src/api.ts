@@ -72,6 +72,40 @@ export type StageRun = {
   memory_bytes?: number | null;
 };
 
+export type DuplicateDecision = {
+  id: string;
+  audio_asset_low_id: string;
+  audio_asset_high_id: string;
+  candidate_fingerprint_low_id: string;
+  candidate_fingerprint_high_id: string;
+  algorithm: string;
+  algorithm_version: string;
+  duration_delta_seconds: number;
+  similarity_score: number;
+  decision: string;
+  confidence: string;
+  duplicate_group_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DuplicateGroupMember = {
+  duplicate_group_id: string;
+  audio_asset_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type DuplicateGroup = {
+  id: string;
+  project_id: string;
+  canonical_audio_asset_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  members: DuplicateGroupMember[];
+  decisions: DuplicateDecision[];
+};
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
@@ -116,6 +150,11 @@ export async function fetchProjectAudioAssets(baseUrl: string, projectId: string
 export async function fetchProjectMetricsSummary(baseUrl: string, projectId: string): Promise<StageRun[]> {
   const body = await requestJson<{ stage_runs: StageRun[] }>(`${baseUrl}/projects/${projectId}/metrics/summary`);
   return body.stage_runs;
+}
+
+export async function fetchProjectDuplicateGroups(baseUrl: string, projectId: string): Promise<DuplicateGroup[]> {
+  const body = await requestJson<{ items: DuplicateGroup[] }>(`${baseUrl}/projects/${projectId}/duplicates`);
+  return body.items;
 }
 
 export async function registerUrl(baseUrl: string, projectId: string, url: string) {

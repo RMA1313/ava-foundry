@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     audio_asset::AudioAssetListFilter,
+    duplicate::DuplicateGroupDetails,
     ingestion,
     job::{JobListFilter, JobStatus, JobType},
     server::AppState,
@@ -216,6 +217,56 @@ struct MetricsSummaryResponse {
     stage_runs: Vec<StageRunResponse>,
 }
 
+#[derive(Deserialize)]
+struct DuplicateListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct DuplicateDecisionResponse {
+    id: String,
+    audio_asset_low_id: String,
+    audio_asset_high_id: String,
+    candidate_fingerprint_low_id: String,
+    candidate_fingerprint_high_id: String,
+    algorithm: String,
+    algorithm_version: String,
+    duration_delta_seconds: f64,
+    similarity_score: f64,
+    decision: String,
+    confidence: String,
+    duplicate_group_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupMemberResponse {
+    duplicate_group_id: String,
+    audio_asset_id: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupResponse {
+    id: String,
+    project_id: String,
+    canonical_audio_asset_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    members: Vec<DuplicateGroupMemberResponse>,
+    decisions: Vec<DuplicateDecisionResponse>,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupsResponse {
+    items: Vec<DuplicateGroupResponse>,
+    limit: u32,
+    offset: u32,
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -254,6 +305,7 @@ pub fn router(state: AppState) -> Router {
             "/projects/:id/audio-assets/:audio_asset_id",
             get(get_audio_asset),
         )
+        .route("/projects/:id/duplicates", get(list_duplicate_groups))
         .route("/projects/:id/metrics/summary", get(metrics_summary))
         .route("/projects/:project_id/jobs/:job_id/retry", post(retry_job))
         .route(
@@ -555,6 +607,33 @@ async fn metrics_summary(
     }))
 }
 
+async fn list_duplicate_groups(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DuplicateListQuery>,
+) -> Result<Json<DuplicateGroupsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let page = state
+        .database
+        .duplicates()
+        .list_groups(
+            project_id,
+            query.limit.unwrap_or(50) as i64,
+            query.offset.unwrap_or(0) as i64,
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(DuplicateGroupsResponse {
+        items: page
+            .items
+            .into_iter()
+            .map(duplicate_group_response)
+            .collect(),
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
 fn stage_run_response(run: StageRun) -> StageRunResponse {
     StageRunResponse {
         id: run.id.to_string(),
@@ -573,6 +652,49 @@ fn stage_run_response(run: StageRun) -> StageRunResponse {
         failure_reason: run.failure_reason,
         cpu_percent: run.cpu_percent,
         memory_bytes: run.memory_bytes,
+    }
+}
+
+fn duplicate_group_response(details: DuplicateGroupDetails) -> DuplicateGroupResponse {
+    DuplicateGroupResponse {
+        id: details.group.id.to_string(),
+        project_id: details.group.project_id.to_string(),
+        canonical_audio_asset_id: details
+            .group
+            .canonical_audio_asset_id
+            .map(|id| id.to_string()),
+        created_at: details.group.created_at.to_rfc3339(),
+        updated_at: details.group.updated_at.to_rfc3339(),
+        members: details
+            .members
+            .into_iter()
+            .map(|member| DuplicateGroupMemberResponse {
+                duplicate_group_id: member.duplicate_group_id.to_string(),
+                audio_asset_id: member.audio_asset_id.to_string(),
+                created_at: member.created_at.to_rfc3339(),
+                updated_at: member.updated_at.to_rfc3339(),
+            })
+            .collect(),
+        decisions: details
+            .decisions
+            .into_iter()
+            .map(|decision| DuplicateDecisionResponse {
+                id: decision.id.to_string(),
+                audio_asset_low_id: decision.audio_asset_low_id.to_string(),
+                audio_asset_high_id: decision.audio_asset_high_id.to_string(),
+                candidate_fingerprint_low_id: decision.candidate_fingerprint_low_id.to_string(),
+                candidate_fingerprint_high_id: decision.candidate_fingerprint_high_id.to_string(),
+                algorithm: decision.algorithm,
+                algorithm_version: decision.algorithm_version,
+                duration_delta_seconds: decision.duration_delta_seconds,
+                similarity_score: decision.similarity_score,
+                decision: decision.decision,
+                confidence: decision.confidence,
+                duplicate_group_id: decision.duplicate_group_id.map(|id| id.to_string()),
+                created_at: decision.created_at.to_rfc3339(),
+                updated_at: decision.updated_at.to_rfc3339(),
+            })
+            .collect(),
     }
 }
 

@@ -3236,7 +3236,7 @@ async fn run_duplicate_detection(
             candidate.id,
         );
         let duplicate_group_id = if decision == "duplicate" {
-            Some(
+            let group_id = Some(
                 state
                     .database
                     .duplicates()
@@ -3245,7 +3245,15 @@ async fn run_duplicate_detection(
                         [audio_asset.id, candidate.audio_asset_id],
                     )
                     .await?,
-            )
+            );
+            if let Some(group_id) = group_id {
+                let _ = state
+                    .database
+                    .duplicates()
+                    .ensure_canonical_audio_asset(group_id)
+                    .await?;
+            }
+            group_id
         } else {
             None
         };
