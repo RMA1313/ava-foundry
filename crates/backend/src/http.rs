@@ -6,7 +6,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{ingestion, server::AppState};
+use crate::{
+    ingestion,
+    job::{JobListFilter, JobStatus, JobType},
+    server::AppState,
+    source::{SourceListFilter, SourceType},
+};
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -51,6 +56,22 @@ struct UrlRegisterRequest {
     url: String,
 }
 
+#[derive(Deserialize)]
+struct SourceListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+    source_type: Option<String>,
+    ingestion_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JobListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+    job_type: Option<String>,
+    status: Option<String>,
+}
+
 #[derive(Serialize)]
 struct ProjectResponse {
     id: String,
@@ -84,6 +105,48 @@ struct RegistrationResponse {
     job_id: String,
 }
 
+#[derive(Serialize)]
+struct SourceResponse {
+    id: String,
+    project_id: String,
+    source_type: String,
+    original_url: Option<String>,
+    ingestion_status: String,
+    progress: String,
+    failure_summary: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct SourcesResponse {
+    items: Vec<SourceResponse>,
+    limit: u32,
+    offset: u32,
+}
+
+#[derive(Serialize)]
+struct JobResponse {
+    id: String,
+    project_id: String,
+    source_id: Option<String>,
+    job_type: String,
+    status: String,
+    priority: i32,
+    attempts: i32,
+    progress: String,
+    failure_summary: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct JobsResponse {
+    items: Vec<JobResponse>,
+    limit: u32,
+    offset: u32,
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -100,12 +163,22 @@ fn error_response(
     )
 }
 
+fn database_error(err: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "database_error",
+        err.to_string(),
+    )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/:id", get(get_project).put(update_project))
+        .route("/projects/:id/sources", get(list_sources))
+        .route("/projects/:id/jobs", get(list_jobs))
         .route(
             "/projects/:id/sources/local-file",
             post(register_local_file),
@@ -247,6 +320,72 @@ async fn register_url(
     }))
 }
 
+async fn list_sources(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SourceListQuery>,
+) -> Result<Json<SourcesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let source_type = match query.source_type.as_deref() {
+        Some(value) => Some(parse_source_type(value)?),
+        None => None,
+    };
+    let page = state
+        .database
+        .sources()
+        .list_paginated(
+            project_id,
+            Some(SourceListFilter {
+                source_type,
+                ingestion_status: query.ingestion_status.clone(),
+            }),
+            query.limit.unwrap_or(50) as i64,
+            query.offset.unwrap_or(0) as i64,
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(SourcesResponse {
+        items: page.items.into_iter().map(source_response).collect(),
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+async fn list_jobs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<JobsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let job_type = match query.job_type.as_deref() {
+        Some(value) => Some(parse_job_type(value)?),
+        None => None,
+    };
+    let status = match query.status.as_deref() {
+        Some(value) => Some(parse_job_status(value)?),
+        None => None,
+    };
+    let page = state
+        .database
+        .jobs()
+        .list_paginated(
+            Some(JobListFilter {
+                project_id: Some(project_id),
+                job_type,
+                status,
+            }),
+            query.limit.unwrap_or(50) as i64,
+            query.offset.unwrap_or(0) as i64,
+        )
+        .await
+        .map_err(database_error)?;
+    Ok(Json(JobsResponse {
+        items: page.items.into_iter().map(job_response).collect(),
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
 async fn scan_folder(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -308,4 +447,129 @@ fn parse_uuid(value: &str) -> Result<uuid::Uuid, (StatusCode, Json<ErrorResponse
             "project id must be a valid uuid",
         )
     })
+}
+
+fn parse_source_type(value: &str) -> Result<SourceType, (StatusCode, Json<ErrorResponse>)> {
+    match value {
+        "local_file" => Ok(SourceType::LocalFile),
+        "local_folder" => Ok(SourceType::LocalFolder),
+        "public_url" => Ok(SourceType::PublicUrl),
+        "csv_import" => Ok(SourceType::CsvImport),
+        "existing_dataset" => Ok(SourceType::ExistingDataset),
+        "hugging_face_dataset" => Ok(SourceType::HuggingFaceDataset),
+        "archive" => Ok(SourceType::Archive),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid source type",
+        )),
+    }
+}
+
+fn parse_job_type(value: &str) -> Result<JobType, (StatusCode, Json<ErrorResponse>)> {
+    match value {
+        "source_registration" => Ok(JobType::SourceRegistration),
+        "media_ingestion" => Ok(JobType::MediaIngestion),
+        "audio_extraction" => Ok(JobType::AudioExtraction),
+        "audio_validation" => Ok(JobType::AudioValidation),
+        "video_cleanup" => Ok(JobType::VideoCleanup),
+        "duplicate_detection" => Ok(JobType::DuplicateDetection),
+        "ai_analysis" => Ok(JobType::AiAnalysis),
+        "interval_mining" => Ok(JobType::IntervalMining),
+        "manual_review" => Ok(JobType::ManualReview),
+        "dataset_export" => Ok(JobType::DatasetExport),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid job type",
+        )),
+    }
+}
+
+fn parse_job_status(value: &str) -> Result<JobStatus, (StatusCode, Json<ErrorResponse>)> {
+    match value {
+        "queued" => Ok(JobStatus::Queued),
+        "running" => Ok(JobStatus::Running),
+        "completed" => Ok(JobStatus::Completed),
+        "failed" => Ok(JobStatus::Failed),
+        "cancelled" => Ok(JobStatus::Cancelled),
+        _ => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid job status",
+        )),
+    }
+}
+
+fn source_response(source: crate::source::Source) -> SourceResponse {
+    let progress = source.ingestion_status.clone();
+    SourceResponse {
+        id: source.id.to_string(),
+        project_id: source.project_id.to_string(),
+        source_type: source_type_name(source.source_type).to_string(),
+        original_url: source.original_url,
+        ingestion_status: progress.clone(),
+        progress,
+        failure_summary: bounded_summary(source.import_metadata.as_deref()),
+        created_at: source.created_at.to_rfc3339(),
+        updated_at: source.updated_at.to_rfc3339(),
+    }
+}
+
+fn job_response(job: crate::job::Job) -> JobResponse {
+    let status = job_status_name(job.status).to_string();
+    JobResponse {
+        id: job.id.to_string(),
+        project_id: job.project_id.to_string(),
+        source_id: job.source_id.map(|id| id.to_string()),
+        job_type: job_type_name(job.job_type).to_string(),
+        status: status.clone(),
+        priority: job.priority,
+        attempts: job.attempts,
+        progress: status,
+        failure_summary: bounded_summary(job.failure_reason.as_deref()),
+        created_at: job.created_at.to_rfc3339(),
+        updated_at: job.updated_at.to_rfc3339(),
+    }
+}
+
+fn source_type_name(source_type: SourceType) -> &'static str {
+    match source_type {
+        SourceType::LocalFile => "local_file",
+        SourceType::LocalFolder => "local_folder",
+        SourceType::PublicUrl => "public_url",
+        SourceType::CsvImport => "csv_import",
+        SourceType::ExistingDataset => "existing_dataset",
+        SourceType::HuggingFaceDataset => "hugging_face_dataset",
+        SourceType::Archive => "archive",
+    }
+}
+
+fn job_type_name(job_type: JobType) -> &'static str {
+    match job_type {
+        JobType::SourceRegistration => "source_registration",
+        JobType::MediaIngestion => "media_ingestion",
+        JobType::AudioExtraction => "audio_extraction",
+        JobType::AudioValidation => "audio_validation",
+        JobType::VideoCleanup => "video_cleanup",
+        JobType::DuplicateDetection => "duplicate_detection",
+        JobType::AiAnalysis => "ai_analysis",
+        JobType::IntervalMining => "interval_mining",
+        JobType::ManualReview => "manual_review",
+        JobType::DatasetExport => "dataset_export",
+    }
+}
+
+fn job_status_name(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "queued",
+        JobStatus::Running => "running",
+        JobStatus::Completed => "completed",
+        JobStatus::Failed => "failed",
+        JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn bounded_summary(value: Option<&str>) -> Option<String> {
+    value.map(|value| value.chars().take(256).collect())
 }

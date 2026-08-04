@@ -59,6 +59,12 @@ pub struct SourceRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceListFilter {
+    pub source_type: Option<SourceType>,
+    pub ingestion_status: Option<String>,
+}
+
 impl SourceRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -115,19 +121,55 @@ impl SourceRepository {
     }
 
     pub async fn list(&self, project_id: Uuid) -> Result<Vec<Source>> {
+        self.list_paginated(project_id, None, 100, 0)
+            .await
+            .map(|page| page.items)
+    }
+
+    pub async fn list_paginated(
+        &self,
+        project_id: Uuid,
+        filter: Option<SourceListFilter>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<SourcePage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let (source_type, ingestion_status) = match filter {
+            Some(filter) => (
+                filter.source_type.map(|value| value.as_str()),
+                filter.ingestion_status,
+            ),
+            None => (None, None),
+        };
         let rows = sqlx::query(
             r#"
             select id, project_id, source_type, original_url,
                    normalized_identity, import_metadata, ingestion_status, created_at, updated_at
             from sources
             where project_id = $1
+              and ($2::text is null or source_type = $2)
+              and ($3::text is null or ingestion_status = $3)
             order by created_at asc, id asc
+            limit $4 offset $5
             "#,
         )
         .bind(project_id)
+        .bind(source_type)
+        .bind(ingestion_status)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(source_from_row).collect()
+        let items = rows
+            .iter()
+            .map(source_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SourcePage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+        })
     }
 
     pub async fn get_by_identity(
@@ -237,6 +279,13 @@ fn source_from_row(row: &PgRow) -> Result<Source> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePage {
+    pub items: Vec<Source>,
+    pub limit: u32,
+    pub offset: u32,
 }
 
 #[cfg(test)]

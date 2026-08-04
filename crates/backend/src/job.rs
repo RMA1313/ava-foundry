@@ -104,6 +104,20 @@ pub struct JobRepository {
     pool: PgPool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobListFilter {
+    pub project_id: Option<Uuid>,
+    pub job_type: Option<JobType>,
+    pub status: Option<JobStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobPage {
+    pub items: Vec<Job>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 impl JobRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -166,19 +180,53 @@ impl JobRepository {
     }
 
     pub async fn list(&self) -> Result<Vec<Job>> {
+        self.list_paginated(None, 100, 0)
+            .await
+            .map(|page| page.items)
+    }
+
+    pub async fn list_paginated(
+        &self,
+        filter: Option<JobListFilter>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<JobPage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let project_id = filter.and_then(|filter| filter.project_id);
+        let job_type = filter
+            .and_then(|filter| filter.job_type)
+            .map(|value| value.as_str());
+        let status = filter
+            .and_then(|filter| filter.status)
+            .map(|value| value.as_str());
         let rows = sqlx::query(
             r#"
             select id, project_id, source_id, job_type, status, priority,
                    attempts, available_at, lease_expires_at, worker_id,
                    failure_reason, created_at, updated_at
             from jobs
+            where ($1::uuid is null or project_id = $1)
+              and ($2::text is null or job_type = $2)
+              and ($3::text is null or status = $3)
             order by priority desc, available_at asc, created_at asc, id asc
+            limit $4 offset $5
             "#,
         )
+        .bind(project_id)
+        .bind(job_type)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
-        rows.iter().map(job_from_row).collect()
+        let items = rows.iter().map(job_from_row).collect::<Result<Vec<_>>>()?;
+        Ok(JobPage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+        })
     }
 
     pub async fn get_by_logical_key(

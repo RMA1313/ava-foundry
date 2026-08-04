@@ -1,6 +1,7 @@
 pub mod config;
 pub mod db;
 pub mod download;
+pub mod hf_adapter;
 pub mod http;
 pub mod ingestion;
 pub mod job;
