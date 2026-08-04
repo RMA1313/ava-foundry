@@ -26,6 +26,7 @@ pub struct AudioAsset {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioAssetUpsert {
+    pub id: Uuid,
     pub media_asset_id: Uuid,
     pub project_id: Uuid,
     pub processing_status: String,
@@ -56,7 +57,6 @@ impl AudioAssetRepository {
     where
         E: Executor<'e, Database = Postgres>,
     {
-        let id = Uuid::new_v4();
         let row = sqlx::query(
             r#"
             insert into audio_assets (
@@ -88,7 +88,7 @@ impl AudioAssetRepository {
                       created_at, updated_at
             "#,
         )
-        .bind(id)
+        .bind(request.id)
         .bind(request.media_asset_id)
         .bind(request.project_id)
         .bind(request.processing_status.as_str())

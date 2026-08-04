@@ -47,7 +47,7 @@ fn missing_directories_are_created_and_finalization_moves_atomically() {
     fs::write(&temporary_path, b"audio").expect("temporary audio");
 
     let final_path = config
-        .finalize_audio_path(&temporary_path, audio_asset_id)
+        .finalize_audio_path(&temporary_path, audio_asset_id, 5)
         .expect("finalization");
     assert!(final_path.exists());
     assert!(!temporary_path.exists());
@@ -56,4 +56,37 @@ fn missing_directories_are_created_and_finalization_moves_atomically() {
         b"audio".to_vec()
     );
     assert!(Path::new(&final_path).starts_with(temp.path().join("audio")));
+
+    let repeated = config
+        .finalize_audio_path(&temporary_path, audio_asset_id, 5)
+        .expect("idempotent finalization");
+    assert_eq!(repeated, final_path);
+}
+
+#[test]
+fn conflicting_existing_destination_is_rejected() {
+    support::clear_env();
+    let temp = tempdir().expect("tempdir");
+    let config = AudioStorageConfig::new(temp.path().join("audio"), temp.path().join("tmp"));
+    let media_asset_id = Uuid::new_v4();
+    let audio_asset_id = Uuid::new_v4();
+
+    config.ensure_roots().expect("roots should be created");
+    let temporary_path = config
+        .temporary_extraction_path(media_asset_id)
+        .expect("temp path");
+    if let Some(parent) = temporary_path.parent() {
+        fs::create_dir_all(parent).expect("temp parent");
+    }
+    fs::write(&temporary_path, b"audio").expect("temporary audio");
+    let final_path = config.permanent_path(audio_asset_id).expect("final path");
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent).expect("final parent");
+    }
+    fs::write(&final_path, b"different").expect("conflicting final audio");
+
+    let err = config
+        .finalize_audio_path(&temporary_path, audio_asset_id, 5)
+        .expect_err("conflict should be rejected");
+    assert!(err.to_string().contains("unexpected size"));
 }

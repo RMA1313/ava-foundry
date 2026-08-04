@@ -107,6 +107,7 @@ async fn repository_round_trip_and_idempotency_work() {
         .upsert(
             &pool,
             AudioAssetUpsert {
+                id: Uuid::new_v4(),
                 media_asset_id,
                 project_id,
                 processing_status: "validated".to_string(),
@@ -130,6 +131,7 @@ async fn repository_round_trip_and_idempotency_work() {
         .upsert(
             &pool,
             AudioAssetUpsert {
+                id: Uuid::new_v4(),
                 media_asset_id,
                 project_id,
                 processing_status: "validated".to_string(),

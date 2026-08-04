@@ -53,10 +53,53 @@ impl AudioStorageConfig {
         &self,
         temporary_path: &Path,
         audio_asset_id: Uuid,
+        expected_byte_size: i64,
     ) -> Result<PathBuf> {
         let final_path = self.permanent_path(audio_asset_id)?;
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        if final_path.exists() {
+            let final_size = fs::metadata(&final_path)
+                .with_context(|| format!("metadata {}", final_path.display()))?
+                .len() as i64;
+            if final_size != expected_byte_size {
+                return Err(anyhow!(
+                    "existing finalized audio has unexpected size: {}",
+                    final_path.display()
+                ));
+            }
+            if temporary_path.exists() {
+                let temporary_size = fs::metadata(temporary_path)
+                    .with_context(|| format!("metadata {}", temporary_path.display()))?
+                    .len() as i64;
+                if temporary_size != expected_byte_size {
+                    return Err(anyhow!(
+                        "temporary audio conflicts with finalized audio: {}",
+                        temporary_path.display()
+                    ));
+                }
+                return Err(anyhow!(
+                    "temporary audio still exists after finalization: {}",
+                    temporary_path.display()
+                ));
+            }
+            return Ok(final_path);
+        }
+        if !temporary_path.exists() {
+            return Err(anyhow!(
+                "temporary audio missing before finalization: {}",
+                temporary_path.display()
+            ));
+        }
+        let temporary_size = fs::metadata(temporary_path)
+            .with_context(|| format!("metadata {}", temporary_path.display()))?
+            .len() as i64;
+        if temporary_size != expected_byte_size {
+            return Err(anyhow!(
+                "temporary audio size does not match validation: {}",
+                temporary_path.display()
+            ));
         }
         fs::rename(temporary_path, &final_path).with_context(|| {
             format!(
@@ -65,6 +108,15 @@ impl AudioStorageConfig {
                 final_path.display()
             )
         })?;
+        let final_size = fs::metadata(&final_path)
+            .with_context(|| format!("metadata {}", final_path.display()))?
+            .len() as i64;
+        if final_size != expected_byte_size {
+            return Err(anyhow!(
+                "finalized audio has unexpected size: {}",
+                final_path.display()
+            ));
+        }
         Ok(final_path)
     }
 }

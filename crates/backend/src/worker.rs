@@ -322,7 +322,9 @@ impl WorkerRuntime {
         let outcome = handler.handle(job.clone(), state.clone()).await?;
         match outcome {
             JobOutcome::Completed => {
-                if job.job_type != JobType::MediaIngestion {
+                if job.job_type != JobType::MediaIngestion
+                    && job.job_type != JobType::AudioValidation
+                {
                     let _ = state.database.jobs().complete(job.id).await?;
                 }
             }
@@ -1410,21 +1412,25 @@ mod tests {
             JobType::AudioValidation,
             audio_validation_handler(ffmpeg, ffprobe),
         );
-        let job = Job {
-            id: Uuid::new_v4(),
-            project_id,
-            source_id: Some(media_asset_id),
-            job_type: JobType::AudioValidation,
-            status: JobStatus::Running,
-            priority: 0,
-            attempts: 0,
-            available_at: Utc::now(),
-            lease_expires_at: None,
-            worker_id: None,
-            failure_reason: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        let created = database
+            .jobs()
+            .create(
+                project_id,
+                Some(media_asset_id),
+                JobType::AudioValidation,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("job claim should succeed")
+            .expect("job should be claimable");
+        assert_eq!(job.id, created.id);
+        let job_id = job.id;
         let handlers = runtime.handlers.clone();
         std::env::set_var("INPUT_FILE", extraction_tmp.to_string_lossy().to_string());
         runtime
@@ -1469,13 +1475,26 @@ mod tests {
             asset.storage_path,
             temp_dir
                 .path()
-                .join("audio-tmp")
-                .join("audio-normalization")
-                .join(media_asset_id.to_string())
-                .with_extension("tmp")
+                .join("audio")
+                .join("audio-assets")
+                .join(format!("{}.flac", asset.id))
                 .to_string_lossy()
                 .to_string()
         );
+        let media_asset = database
+            .media_assets()
+            .get(media_asset_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(media_asset.extraction_status.as_deref(), Some("completed"));
+        assert_eq!(
+            media_asset.extraction_progress.as_deref(),
+            Some("validated")
+        );
+        assert_eq!(media_asset.extraction_tmp_path.as_deref(), None);
+        let completed_job = database.jobs().get(job_id).await.unwrap().unwrap();
+        assert_eq!(completed_job.status, JobStatus::Completed);
     }
 
     #[tokio::test]
@@ -1535,6 +1554,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(asset.validation_status.as_deref(), Some("rejected"));
+    }
+
+    #[tokio::test]
+    async fn audio_completion_rolls_back_when_media_update_fails() {
+        clear_env();
+        let pool = test_pool().await;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (project_id, _source_id, media_asset_id, extraction_tmp) =
+            seed_validating_media_asset(&pool, &temp_dir).await;
+        let database = Database::from_pool(pool.clone());
+        let created = database
+            .jobs()
+            .create(
+                project_id,
+                Some(media_asset_id),
+                JobType::AudioValidation,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .expect("job claim should succeed")
+            .expect("job should be claimable");
+        assert_eq!(job.id, created.id);
+        let media_asset = database
+            .media_assets()
+            .get(media_asset_id)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("delete from media_assets where id = $1")
+            .bind(media_asset_id)
+            .execute(&pool)
+            .await
+            .expect("media asset deletion should succeed");
+
+        let result = complete_audio_validation(
+            &AppState {
+                database: database.clone(),
+                staging_dir: temp_dir.path().to_path_buf(),
+                audio_storage: AudioStorageConfig::new(
+                    temp_dir.path().join("audio"),
+                    temp_dir.path().join("audio-tmp"),
+                ),
+                audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+                staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                    1,
+                    2,
+                    DefaultFilesystemMetrics,
+                )),
+            },
+            &job,
+            &media_asset,
+            &extraction_tmp,
+            "flac:flac:16000:1",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(database
+            .audio_assets()
+            .get_by_media_asset(media_asset_id)
+            .await
+            .unwrap()
+            .is_none());
+        let current_job = database.jobs().get(job.id).await.unwrap().unwrap();
+        assert_eq!(current_job.status, JobStatus::Running);
     }
 
     #[test]
@@ -1819,18 +1908,15 @@ async fn handle_audio_validation_job(
     let validation = validate_normalized_audio(&ffprobe, &normalized_path, &profile).await;
     match validation {
         Ok(validated) => {
-            persist_audio_validation_state(
-                &state.database,
-                &media_asset,
-                Some("validated"),
-                Some(profile_string.as_str()),
-                Some("validated"),
-                None,
-                Some(normalized_path.to_string_lossy().as_ref()),
-            )
-            .await?;
-            let _ = tokio::fs::metadata(&normalized_path).await?;
             if validated {
+                complete_audio_validation(
+                    state,
+                    &job,
+                    &media_asset,
+                    &normalized_path,
+                    &profile_string,
+                )
+                .await?;
                 Ok(JobOutcome::Completed)
             } else {
                 Ok(JobOutcome::Failed {
@@ -1854,6 +1940,95 @@ async fn handle_audio_validation_job(
             })
         }
     }
+}
+
+async fn complete_audio_validation(
+    state: &AppState,
+    job: &Job,
+    media_asset: &crate::media_asset::MediaAsset,
+    normalized_path: &Path,
+    profile_string: &str,
+) -> Result<()> {
+    let audio_asset_id = state
+        .database
+        .audio_assets()
+        .get_by_media_asset(media_asset.id)
+        .await?
+        .map(|asset| asset.id)
+        .unwrap_or_else(Uuid::new_v4);
+    let byte_size = tokio::fs::metadata(normalized_path).await?.len() as i64;
+    let final_path =
+        state
+            .audio_storage
+            .finalize_audio_path(normalized_path, audio_asset_id, byte_size)?;
+    let mut tx = state.database.pool().begin().await?;
+    let audio_asset = state
+        .database
+        .audio_assets()
+        .upsert(
+            &mut *tx,
+            crate::audio_asset::AudioAssetUpsert {
+                id: audio_asset_id,
+                media_asset_id: media_asset.id,
+                project_id: media_asset.project_id,
+                processing_status: "validated".to_string(),
+                normalization_profile: Some(profile_string.to_string()),
+                validation_status: Some("validated".to_string()),
+                validation_error: None,
+                validated_at: Some(Utc::now()),
+                duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                audio_format: "flac".to_string(),
+                codec: "flac".to_string(),
+                sample_rate_hz: 16_000,
+                channels: 1,
+                byte_size,
+                storage_path: final_path.to_string_lossy().to_string(),
+            },
+        )
+        .await?;
+    let media_update = sqlx::query(
+        r#"
+        update media_assets
+        set extraction_status = 'completed',
+            extraction_progress = 'validated',
+            extraction_tmp_path = null,
+            extracted_at = now(),
+            container_format = $2,
+            duration_seconds = $3,
+            codecs = $4,
+            sample_rate_hz = $5,
+            channels = $6,
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(media_asset.id)
+    .bind(&audio_asset.audio_format)
+    .bind(audio_asset.duration_seconds)
+    .bind(&audio_asset.codec)
+    .bind(audio_asset.sample_rate_hz)
+    .bind(audio_asset.channels)
+    .execute(&mut *tx)
+    .await?;
+    if media_update.rows_affected() != 1 {
+        return Err(anyhow!("media asset not found"));
+    }
+    let job_update = sqlx::query(
+        r#"
+        update jobs
+        set status = 'completed',
+            updated_at = now()
+        where id = $1
+        "#,
+    )
+    .bind(job.id)
+    .execute(&mut *tx)
+    .await?;
+    if job_update.rows_affected() != 1 {
+        return Err(anyhow!("job not found"));
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn validate_normalized_audio(
@@ -1932,6 +2107,7 @@ async fn persist_audio_validation_state(
         .upsert(
             database.pool(),
             crate::audio_asset::AudioAssetUpsert {
+                id: Uuid::new_v4(),
                 media_asset_id: media_asset.id,
                 project_id: media_asset.project_id,
                 processing_status: processing_status.unwrap_or("normalized").to_string(),
