@@ -16,7 +16,6 @@ Core constraints:
 - Rust owns orchestration and business logic.
 - PostgreSQL is the only database and durable job queue.
 - React provides the dashboard.
-- Python is used only for local inference.
 - Audio is the permanent asset.
 - Videos are temporary.
 - Processing is asynchronous, restart-safe, and idempotent.
@@ -40,9 +39,14 @@ If behavior changes:
 
 ## Testing
 
+## Testing
+
 Every completed task must include appropriate automated tests.
 
-Run relevant validation before considering a task complete.
+Run the narrowest relevant validation during implementation.
+
+Before completing a multi-task batch, run all affected component checks.
+Run full repository validation only when explicitly requested or at phase boundaries.
 
 Default validation:
 
