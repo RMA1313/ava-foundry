@@ -13,6 +13,7 @@ use crate::{
     job::{JobListFilter, JobStatus, JobType},
     server::AppState,
     source::{SourceListFilter, SourceType},
+    stage_run::StageRun,
 };
 
 #[derive(Serialize)]
@@ -190,6 +191,31 @@ struct AudioAssetsResponse {
     offset: u32,
 }
 
+#[derive(Serialize)]
+struct StageRunResponse {
+    id: String,
+    project_id: String,
+    media_asset_id: Option<String>,
+    audio_asset_id: Option<String>,
+    job_id: Option<String>,
+    stage_name: String,
+    status: String,
+    queue_wait_ms: i64,
+    wall_time_ms: i64,
+    input_bytes: i64,
+    output_bytes: i64,
+    input_duration_seconds: f64,
+    throughput: Option<f64>,
+    failure_reason: Option<String>,
+    cpu_percent: Option<f64>,
+    memory_bytes: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct MetricsSummaryResponse {
+    stage_runs: Vec<StageRunResponse>,
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -228,6 +254,7 @@ pub fn router(state: AppState) -> Router {
             "/projects/:id/audio-assets/:audio_asset_id",
             get(get_audio_asset),
         )
+        .route("/projects/:id/metrics/summary", get(metrics_summary))
         .route("/projects/:project_id/jobs/:job_id/retry", post(retry_job))
         .route(
             "/projects/:id/sources/local-file",
@@ -504,6 +531,49 @@ async fn get_audio_asset(
         })?;
     let source_id = resolve_audio_asset_source_id(&state, audio_asset.media_asset_id).await?;
     Ok(Json(audio_asset_response(audio_asset, source_id)))
+}
+
+async fn metrics_summary(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<MetricsSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let id = Uuid::parse_str(&id).map_err(|err| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_project_id",
+            err.to_string(),
+        )
+    })?;
+    let runs = state
+        .database
+        .stage_runs()
+        .list_by_project(id)
+        .await
+        .map_err(database_error)?;
+    Ok(Json(MetricsSummaryResponse {
+        stage_runs: runs.into_iter().map(stage_run_response).collect(),
+    }))
+}
+
+fn stage_run_response(run: StageRun) -> StageRunResponse {
+    StageRunResponse {
+        id: run.id.to_string(),
+        project_id: run.project_id.to_string(),
+        media_asset_id: run.media_asset_id.map(|value| value.to_string()),
+        audio_asset_id: run.audio_asset_id.map(|value| value.to_string()),
+        job_id: run.job_id.map(|value| value.to_string()),
+        stage_name: run.stage_name,
+        status: run.status,
+        queue_wait_ms: run.queue_wait_ms,
+        wall_time_ms: run.wall_time_ms,
+        input_bytes: run.input_bytes,
+        output_bytes: run.output_bytes,
+        input_duration_seconds: run.input_duration_seconds,
+        throughput: run.throughput,
+        failure_reason: run.failure_reason,
+        cpu_percent: run.cpu_percent,
+        memory_bytes: run.memory_bytes,
+    }
 }
 
 async fn retry_job(

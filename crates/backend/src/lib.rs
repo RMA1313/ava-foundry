@@ -13,5 +13,6 @@ pub mod migrations;
 pub mod project;
 pub mod server;
 pub mod source;
+pub mod stage_run;
 pub mod storage;
 pub mod worker;

@@ -6,6 +6,7 @@ use crate::job::JobRepository;
 use crate::media_asset::MediaAssetRepository;
 use crate::project::ProjectRepository;
 use crate::source::SourceRepository;
+use crate::stage_run::StageRunRepository;
 
 #[derive(Clone)]
 pub struct Database {
@@ -47,6 +48,10 @@ impl Database {
 
     pub fn audio_assets(&self) -> AudioAssetRepository {
         AudioAssetRepository::new(self.pool.clone())
+    }
+
+    pub fn stage_runs(&self) -> StageRunRepository {
+        StageRunRepository::new(self.pool.clone())
     }
 
     pub async fn is_ready(&self) -> bool {

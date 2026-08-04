@@ -34,6 +34,44 @@ export type Job = {
   failure_summary?: string | null;
 };
 
+export type AudioAsset = {
+  id: string;
+  project_id: string;
+  media_asset_id: string;
+  source_id?: string | null;
+  processing_status: string;
+  normalization_profile?: string | null;
+  validation_status?: string | null;
+  validation_error?: string | null;
+  validated_at?: string | null;
+  duration_seconds: number;
+  audio_format: string;
+  codec: string;
+  sample_rate_hz: number;
+  channels: number;
+  byte_size: number;
+  storage_path: string;
+};
+
+export type StageRun = {
+  id: string;
+  project_id: string;
+  media_asset_id?: string | null;
+  audio_asset_id?: string | null;
+  job_id?: string | null;
+  stage_name: string;
+  status: string;
+  queue_wait_ms: number;
+  wall_time_ms: number;
+  input_bytes: number;
+  output_bytes: number;
+  input_duration_seconds: number;
+  throughput?: number | null;
+  failure_reason?: string | null;
+  cpu_percent?: number | null;
+  memory_bytes?: number | null;
+};
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
@@ -68,6 +106,16 @@ export async function fetchProjectSources(baseUrl: string, projectId: string): P
 export async function fetchProjectJobs(baseUrl: string, projectId: string): Promise<Job[]> {
   const body = await requestJson<{ items: Job[] }>(`${baseUrl}/projects/${projectId}/jobs`);
   return body.items;
+}
+
+export async function fetchProjectAudioAssets(baseUrl: string, projectId: string): Promise<AudioAsset[]> {
+  const body = await requestJson<{ items: AudioAsset[] }>(`${baseUrl}/projects/${projectId}/audio-assets`);
+  return body.items;
+}
+
+export async function fetchProjectMetricsSummary(baseUrl: string, projectId: string): Promise<StageRun[]> {
+  const body = await requestJson<{ stage_runs: StageRun[] }>(`${baseUrl}/projects/${projectId}/metrics/summary`);
+  return body.stage_runs;
 }
 
 export async function registerUrl(baseUrl: string, projectId: string, url: string) {

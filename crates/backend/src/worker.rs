@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use anyhow::{anyhow, Result};
@@ -24,6 +25,7 @@ use crate::{
     ingestion,
     job::{Job, JobType},
     server::AppState,
+    stage_run::StageRun,
 };
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<JobOutcome>> + Send>>;
@@ -2017,6 +2019,8 @@ async fn handle_audio_extraction_job(
     job: Job,
     ffmpeg_path: &Path,
 ) -> Result<JobOutcome> {
+    let started = Instant::now();
+    let queued_at = job.available_at;
     let media_asset_id = job
         .source_id
         .ok_or_else(|| anyhow!("audio extraction job requires a media asset id"))?;
@@ -2094,6 +2098,33 @@ async fn handle_audio_extraction_job(
     let status = process.wait().await;
     match status {
         Ok(output) if output.status.success() => {
+            record_stage_run(
+                &state.database,
+                StageRun {
+                    id: Uuid::new_v4(),
+                    project_id: media_asset.project_id,
+                    media_asset_id: Some(media_asset.id),
+                    audio_asset_id: None,
+                    job_id: Some(job.id),
+                    stage_name: "audio_extraction".to_string(),
+                    status: "completed".to_string(),
+                    queue_wait_ms: queue_wait_ms(queued_at),
+                    wall_time_ms: started.elapsed().as_millis() as i64,
+                    input_bytes: media_asset.byte_size,
+                    output_bytes: tokio::fs::metadata(&temp_path)
+                        .await
+                        .map(|meta| meta.len() as i64)
+                        .unwrap_or(0),
+                    input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                    throughput: throughput(media_asset.duration_seconds.unwrap_or(0.0), started),
+                    failure_reason: None,
+                    cpu_percent: None,
+                    memory_bytes: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await?;
             persist_audio_extraction_state(
                 &state.database,
                 &media_asset,
@@ -2111,6 +2142,30 @@ async fn handle_audio_extraction_job(
         }
         Ok(_) => {
             let _ = tokio::fs::remove_file(&temp_path).await;
+            record_stage_run(
+                &state.database,
+                StageRun {
+                    id: Uuid::new_v4(),
+                    project_id: media_asset.project_id,
+                    media_asset_id: Some(media_asset.id),
+                    audio_asset_id: None,
+                    job_id: Some(job.id),
+                    stage_name: "audio_extraction".to_string(),
+                    status: "failed".to_string(),
+                    queue_wait_ms: queue_wait_ms(queued_at),
+                    wall_time_ms: started.elapsed().as_millis() as i64,
+                    input_bytes: media_asset.byte_size,
+                    output_bytes: 0,
+                    input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                    throughput: None,
+                    failure_reason: Some("ffmpeg failed".to_string()),
+                    cpu_percent: optional_cpu_percent(),
+                    memory_bytes: optional_memory_bytes(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await?;
             persist_audio_extraction_state(
                 &state.database,
                 &media_asset,
@@ -2127,6 +2182,30 @@ async fn handle_audio_extraction_job(
         }
         Err(err) => {
             let _ = tokio::fs::remove_file(&temp_path).await;
+            record_stage_run(
+                &state.database,
+                StageRun {
+                    id: Uuid::new_v4(),
+                    project_id: media_asset.project_id,
+                    media_asset_id: Some(media_asset.id),
+                    audio_asset_id: None,
+                    job_id: Some(job.id),
+                    stage_name: "audio_extraction".to_string(),
+                    status: "failed".to_string(),
+                    queue_wait_ms: queue_wait_ms(queued_at),
+                    wall_time_ms: started.elapsed().as_millis() as i64,
+                    input_bytes: media_asset.byte_size,
+                    output_bytes: 0,
+                    input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                    throughput: None,
+                    failure_reason: Some(err.to_string()),
+                    cpu_percent: optional_cpu_percent(),
+                    memory_bytes: optional_memory_bytes(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .await?;
             persist_audio_extraction_state(
                 &state.database,
                 &media_asset,
@@ -2187,6 +2266,8 @@ async fn handle_audio_validation_job(
     ffmpeg_path: &Path,
     ffprobe_path: &Path,
 ) -> Result<JobOutcome> {
+    let started = Instant::now();
+    let queued_at = job.available_at;
     let media_asset_id = job
         .source_id
         .ok_or_else(|| anyhow!("audio validation job requires a media asset id"))?;
@@ -2285,6 +2366,47 @@ async fn handle_audio_validation_job(
                     &profile_string,
                 )
                 .await?;
+                record_stage_run(
+                    &state.database,
+                    StageRun {
+                        id: Uuid::new_v4(),
+                        project_id: media_asset.project_id,
+                        media_asset_id: Some(media_asset.id),
+                        audio_asset_id: state
+                            .database
+                            .audio_assets()
+                            .get_by_media_asset(media_asset.id)
+                            .await?
+                            .map(|asset| asset.id),
+                        job_id: Some(job.id),
+                        stage_name: "audio_validation".to_string(),
+                        status: "completed".to_string(),
+                        queue_wait_ms: queue_wait_ms(queued_at),
+                        wall_time_ms: started.elapsed().as_millis() as i64,
+                        input_bytes: tokio::fs::metadata(&extraction_tmp_path)
+                            .await
+                            .map(|meta| meta.len() as i64)
+                            .unwrap_or(0),
+                        output_bytes: state
+                            .database
+                            .audio_assets()
+                            .get_by_media_asset(media_asset.id)
+                            .await?
+                            .map(|asset| asset.byte_size)
+                            .unwrap_or(0),
+                        input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                        throughput: throughput(
+                            media_asset.duration_seconds.unwrap_or(0.0),
+                            started,
+                        ),
+                        failure_reason: None,
+                        cpu_percent: optional_cpu_percent(),
+                        memory_bytes: optional_memory_bytes(),
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    },
+                )
+                .await?;
                 Ok(JobOutcome::Completed)
             } else {
                 Ok(JobOutcome::Failed {
@@ -2301,6 +2423,33 @@ async fn handle_audio_validation_job(
                 Some("rejected"),
                 Some(&err.to_string()),
                 Some(normalized_path.to_string_lossy().as_ref()),
+            )
+            .await?;
+            record_stage_run(
+                &state.database,
+                StageRun {
+                    id: Uuid::new_v4(),
+                    project_id: media_asset.project_id,
+                    media_asset_id: Some(media_asset.id),
+                    audio_asset_id: None,
+                    job_id: Some(job.id),
+                    stage_name: "audio_validation".to_string(),
+                    status: "failed".to_string(),
+                    queue_wait_ms: queue_wait_ms(queued_at),
+                    wall_time_ms: started.elapsed().as_millis() as i64,
+                    input_bytes: tokio::fs::metadata(&extraction_tmp_path)
+                        .await
+                        .map(|meta| meta.len() as i64)
+                        .unwrap_or(0),
+                    output_bytes: 0,
+                    input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+                    throughput: None,
+                    failure_reason: Some(err.to_string()),
+                    cpu_percent: optional_cpu_percent(),
+                    memory_bytes: optional_memory_bytes(),
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
             )
             .await?;
             Ok(JobOutcome::Failed {
@@ -2417,6 +2566,8 @@ async fn complete_audio_validation(
 }
 
 async fn handle_video_cleanup_job(state: &AppState, job: Job) -> Result<JobOutcome> {
+    let started = Instant::now();
+    let queued_at = job.available_at;
     let media_asset_id = job
         .source_id
         .ok_or_else(|| anyhow!("video cleanup job requires a media asset id"))?;
@@ -2484,8 +2635,59 @@ async fn handle_video_cleanup_job(state: &AppState, job: Job) -> Result<JobOutco
     .bind(media_asset_id)
     .execute(state.database.pool())
     .await?;
+    record_stage_run(
+        &state.database,
+        StageRun {
+            id: Uuid::new_v4(),
+            project_id: media_asset.project_id,
+            media_asset_id: Some(media_asset.id),
+            audio_asset_id: Some(audio_asset.id),
+            job_id: Some(job.id),
+            stage_name: "video_cleanup".to_string(),
+            status: "completed".to_string(),
+            queue_wait_ms: queue_wait_ms(queued_at),
+            wall_time_ms: started.elapsed().as_millis() as i64,
+            input_bytes: media_asset.byte_size,
+            output_bytes: 0,
+            input_duration_seconds: media_asset.duration_seconds.unwrap_or(0.0),
+            throughput: None,
+            failure_reason: None,
+            cpu_percent: optional_cpu_percent(),
+            memory_bytes: optional_memory_bytes(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    )
+    .await?;
 
     Ok(JobOutcome::Completed)
+}
+
+fn queue_wait_ms(available_at: chrono::DateTime<Utc>) -> i64 {
+    (Utc::now() - available_at).num_milliseconds().max(0)
+}
+
+fn throughput(input_duration_seconds: f64, started: Instant) -> Option<f64> {
+    let wall_seconds = started.elapsed().as_secs_f64();
+    (wall_seconds > 0.0 && input_duration_seconds > 0.0)
+        .then_some(input_duration_seconds / wall_seconds)
+}
+
+fn optional_cpu_percent() -> Option<f64> {
+    std::env::var("DATA_STUDIO_CPU_PERCENT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn optional_memory_bytes() -> Option<i64> {
+    std::env::var("DATA_STUDIO_MEMORY_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+async fn record_stage_run(database: &crate::db::Database, run: StageRun) -> Result<()> {
+    let _ = database.stage_runs().insert(database.pool(), run).await?;
+    Ok(())
 }
 
 async fn validate_normalized_audio(
