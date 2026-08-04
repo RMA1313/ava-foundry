@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{multipart::Multipart, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::{
@@ -116,6 +117,12 @@ struct ErrorDetail {
 }
 
 #[derive(Serialize)]
+struct UploadResponse {
+    path: String,
+    byte_size: u64,
+}
+
+#[derive(Serialize)]
 struct RegistrationResponse {
     source_id: String,
     job_id: String,
@@ -190,6 +197,21 @@ struct AudioAssetsResponse {
     items: Vec<AudioAssetResponse>,
     limit: u32,
     offset: u32,
+}
+
+#[derive(Serialize)]
+struct DatasetImportResponse {
+    imported: u32,
+    duplicate: u32,
+    invalid: u32,
+    failed: u32,
+    row_failures: Vec<RowFailureResponse>,
+}
+
+#[derive(Serialize)]
+struct RowFailureResponse {
+    row: u32,
+    reason: String,
 }
 
 #[derive(Serialize)]
@@ -326,6 +348,9 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id/sources/folder-scan", post(scan_folder))
         .route("/projects/:id/sources/csv-import", post(import_csv))
         .route("/projects/:id/sources/url", post(register_url))
+        .route("/projects/:id/uploads/media", post(upload_media))
+        .route("/projects/:id/uploads/archive", post(upload_archive))
+        .route("/projects/:id/datasets/import", post(import_dataset))
         .with_state(state)
 }
 
@@ -902,7 +927,199 @@ async fn import_csv(
         "duplicate": summary.duplicate,
         "invalid": summary.invalid,
         "failed": summary.failed,
+        "row_failures": summary.row_failures.into_iter().map(|failure| serde_json::json!({
+            "row": failure.row,
+            "reason": failure.reason,
+        })).collect::<Vec<_>>(),
     })))
+}
+
+async fn upload_file(
+    state: AppState,
+    id: String,
+    mut multipart: Multipart,
+    kind: &str,
+) -> Result<Json<UploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let mut file_path: Option<PathBuf> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
+    {
+        if field.name().unwrap_or_default() == "file" {
+            let filename = field.file_name().unwrap_or(kind).to_string();
+            let path = persist_upload(&state, project_id, filename, field)
+                .await
+                .map_err(|err| {
+                    error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+                })?;
+            file_path = Some(path);
+        }
+    }
+    let file_path = file_path.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing file upload",
+        )
+    })?;
+    let byte_size = std::fs::metadata(&file_path)
+        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
+        .len();
+    Ok(Json(UploadResponse {
+        path: file_path.display().to_string(),
+        byte_size,
+    }))
+}
+
+async fn persist_upload(
+    state: &AppState,
+    project_id: Uuid,
+    filename: String,
+    mut field: axum::extract::multipart::Field<'_>,
+) -> anyhow::Result<PathBuf> {
+    let upload_dir = state
+        .staging_dir
+        .join("uploads")
+        .join(project_id.to_string());
+    tokio::fs::create_dir_all(&upload_dir).await?;
+    let target = upload_dir.join(filename);
+    let mut file = tokio::fs::File::create(&target).await?;
+    while let Some(chunk) = field.chunk().await? {
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    }
+    Ok(target)
+}
+
+async fn upload_media(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    upload_file(state, id, multipart, "media").await
+}
+
+async fn upload_archive(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<UploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    upload_file(state, id, multipart, "archive").await
+}
+
+async fn import_dataset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<DatasetImportResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let mut file_path: Option<PathBuf> = None;
+    let mut audio_path_field = String::from("audio_path");
+    let mut selected_manifest_path: Option<PathBuf> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
+    {
+        match field.name().unwrap_or_default() {
+            "file" => {
+                let filename = field.file_name().unwrap_or("dataset");
+                let filename = filename.to_string();
+                let path = persist_upload(&state, project_id, filename, field)
+                    .await
+                    .map_err(|err| {
+                        error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+                    })?;
+                file_path = Some(path);
+            }
+            "audio_path_field" => {
+                audio_path_field = field.text().await.unwrap_or(audio_path_field);
+            }
+            "selected_manifest_path" => {
+                let value = field.text().await.unwrap_or_default();
+                if !value.trim().is_empty() {
+                    selected_manifest_path = Some(PathBuf::from(value));
+                }
+            }
+            _ => {}
+        }
+    }
+    let file_path = file_path.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing file upload",
+        )
+    })?;
+    let summary = match file_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("csv") | Some("jsonl") | Some("json") | Some("parquet") => {
+            let imported = ingestion::import_dataset_manifest(
+                &state.database,
+                project_id,
+                &file_path,
+                &audio_path_field,
+            )
+            .await
+            .map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?;
+            ingestion::CsvImportSummary {
+                imported: imported.len() as u32,
+                duplicate: 0,
+                invalid: 0,
+                failed: 0,
+                row_failures: vec![],
+            }
+        }
+        Some("zip") | Some("tar") | Some("gz") | Some("tgz") => {
+            let results = ingestion::import_archive_dataset(
+                &state.database,
+                project_id,
+                &file_path,
+                selected_manifest_path.as_deref(),
+                &audio_path_field,
+                &state.staging_dir,
+            )
+            .await
+            .map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?;
+            crate::ingestion::CsvImportSummary {
+                imported: results.len() as u32,
+                duplicate: 0,
+                invalid: 0,
+                failed: 0,
+                row_failures: vec![],
+            }
+        }
+        _ => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "unsupported dataset format",
+            ))
+        }
+    };
+    Ok(Json(DatasetImportResponse {
+        imported: summary.imported,
+        duplicate: summary.duplicate,
+        invalid: summary.invalid,
+        failed: summary.failed,
+        row_failures: summary
+            .row_failures
+            .into_iter()
+            .map(|failure| RowFailureResponse {
+                row: failure.row,
+                reason: failure.reason,
+            })
+            .collect(),
+    }))
 }
 
 impl From<crate::project::Project> for ProjectResponse {

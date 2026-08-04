@@ -1,246 +1,114 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Navigate, NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import {
   fetchLiveness,
   fetchProjects,
-  fetchProjectAudioAssets,
-  fetchProjectDuplicateGroups,
-  fetchProjectMetricsSummary,
-  type AudioAsset,
-  type DuplicateGroup,
-  type MetricsSummary,
+  fetchProjectSources,
+  importDataset,
+  uploadArchive,
+  uploadMedia,
   type Project,
-  type StageRun,
+  type Source,
 } from "./api";
 
-function badge(value: string) {
-  return <span style={{ padding: "2px 8px", borderRadius: 999, background: "#1f2937", color: "white" }}>{value}</span>;
-}
+const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8080";
 
-function DashboardPage() {
-  const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8080";
-  const [liveness, setLiveness] = useState<"loading" | "ready" | "unavailable">("loading");
+function WorkspaceShell({ children }: { children: React.ReactNode }) {
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
-  const [audioAssets, setAudioAssets] = useState<AudioAsset[] | null>(null);
-  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[] | null>(null);
-  const [stageRuns, setStageRuns] = useState<StageRun[] | null>(null);
-  const [metricsSummary, setMetricsSummary] = useState<MetricsSummary | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [refreshing, setRefreshing] = useState(false);
-
-  const selectedProject = useMemo(
-    () => projects.find((project) => project.id === selectedProjectId) ?? null,
-    [projects, selectedProjectId],
-  );
-
-  async function refreshProjectData(projectId: string) {
-    const [nextAssets, nextGroups, nextRuns] = await Promise.all([
-      fetchProjectAudioAssets(baseUrl, projectId),
-      fetchProjectDuplicateGroups(baseUrl, projectId),
-      fetchProjectMetricsSummary(baseUrl, projectId),
-    ]);
-    setAudioAssets(nextAssets);
-    setDuplicateGroups(nextGroups);
-    setStageRuns(nextRuns.stage_runs);
-    setMetricsSummary(nextRuns);
-    setError(null);
-  }
+  const [status, setStatus] = useState("checking");
+  const navigate = useNavigate();
+  const params = useParams();
 
   useEffect(() => {
-    fetchLiveness(baseUrl)
-      .then((ok) => setLiveness(ok ? "ready" : "unavailable"))
-      .catch(() => setLiveness("unavailable"));
-  }, [baseUrl]);
+    fetchLiveness(baseUrl).then((ok) => setStatus(ok ? "ready" : "offline"));
+    fetchProjects(baseUrl).then(setProjects);
+  }, []);
+
+  const selectedProjectId = params.projectId ?? projects[0]?.id ?? "";
 
   useEffect(() => {
-    fetchProjects(baseUrl)
-      .then((items) => {
-        setProjects(items);
-        setSelectedProjectId((current) => current || items[0]?.id || "");
-      })
-      .catch(() => {
-        setProjects([]);
-      });
-  }, [baseUrl]);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setAudioAssets(null);
-      setDuplicateGroups(null);
-      setStageRuns(null);
-      setMetricsSummary(null);
-      return;
+    if (!params.projectId && projects[0]?.id) {
+      navigate(`/projects/${projects[0].id}/sources`, { replace: true });
     }
-    let cancelled = false;
-    setAudioAssets(null);
-    setDuplicateGroups(null);
-    setStageRuns(null);
-    setMetricsSummary(null);
-    setRefreshing(true);
-    refreshProjectData(selectedProjectId)
-      .catch(() => {
-        if (!cancelled) setError("API error while loading duplicate groups.");
-      })
-      .finally(() => {
-        if (!cancelled) setRefreshing(false);
-      });
-    const interval = window.setInterval(() => {
-      setRefreshing(true);
-      refreshProjectData(selectedProjectId)
-        .catch(() => {
-          if (!cancelled) setError("API error while refreshing duplicate groups.");
-        })
-        .finally(() => {
-          if (!cancelled) setRefreshing(false);
-        });
-    }, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [baseUrl, selectedProjectId]);
-
-  async function handleSelect(event: FormEvent<HTMLSelectElement>) {
-    setSelectedProjectId((event.currentTarget as HTMLSelectElement).value);
-  }
-
-  const projectStatus =
-    liveness === "ready" ? "Backend is reachable." : liveness === "unavailable" ? "Backend is unavailable." : "Checking backend...";
+  }, [navigate, params.projectId, projects]);
 
   return (
-    <main style={{ fontFamily: "system-ui, sans-serif", maxWidth: 1280, margin: "0 auto", padding: 24, background: "linear-gradient(180deg, #f8fafc, #eef2ff)" }}>
-      <header style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "baseline", marginBottom: 24 }}>
+    <div dir="rtl" style={{ minHeight: "100vh", background: "linear-gradient(180deg,#f8fafc,#e2e8f0)", color: "#0f172a", fontFamily: "Tahoma, sans-serif" }}>
+      <header style={{ padding: "24px 28px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(15,23,42,0.08)" }}>
         <div>
-          <h1 style={{ margin: 0 }}>Audio Processing Dashboard</h1>
-          <p style={{ margin: "8px 0 0" }}>{projectStatus}</p>
+          <div style={{ fontSize: 14, color: "#475569" }}>وضعیت: {status === "ready" ? "آماده" : status === "offline" ? "آفلاین" : "در حال بررسی"}</div>
+          <h1 style={{ margin: "8px 0 0", fontSize: 28 }}>فضای کاری پروژه</h1>
         </div>
+        <select value={selectedProjectId} onChange={(e) => navigate(`/projects/${e.target.value}/sources`)} style={{ padding: 12, borderRadius: 12 }}>
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>{project.name}</option>
+          ))}
+        </select>
       </header>
-
-      <section style={{ marginBottom: 24 }}>
-        <label>
-          Project{" "}
-          <select value={selectedProjectId} onChange={handleSelect}>
-            <option value="">Select a project</option>
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        {selectedProject ? <p>Viewing {selectedProject.name}</p> : <p>Select a project to inspect audio assets.</p>}
-      </section>
-
-      {error ? <section><strong>{error}</strong></section> : null}
-      {refreshing ? <section><p>Refreshing duplicate groups...</p></section> : null}
-
-      <section style={{ marginBottom: 24 }}>
-        <h2>Audio Assets</h2>
-        {audioAssets === null ? (
-          <p>Loading audio assets...</p>
-        ) : audioAssets.length === 0 ? (
-          <p>No audio assets yet.</p>
-        ) : (
-          <div style={{ display: "grid", gap: 16 }}>
-            {audioAssets.map((asset) => (
-              <article key={asset.id} style={{ padding: 16, border: "1px solid #cbd5e1", borderRadius: 12, background: "white" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <strong>{asset.id}</strong>
-                  {badge(asset.processing_status)}
-                </div>
-                <div>Media Asset: {asset.media_asset_id}</div>
-                <div>Source: {asset.source_id ?? "unknown"}</div>
-                <div>Duration: {asset.duration_seconds}s</div>
-                <div>
-                  Format: {asset.audio_format} | Codec: {asset.codec} | {asset.sample_rate_hz} Hz | {asset.channels} ch | {asset.byte_size} bytes
-                </div>
-                <div>Storage: {asset.storage_path}</div>
-                <div>Validation: {asset.validation_status ?? "unknown"}</div>
-                {asset.validation_error ? <div style={{ color: "#b91c1c" }}>Failure: {asset.validation_error}</div> : null}
-                {asset.normalization_profile ? <div>Profile: {asset.normalization_profile}</div> : null}
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section style={{ marginBottom: 24 }}>
-        <h2>Duplicate Groups</h2>
-        {duplicateGroups === null ? (
-          <p>Loading duplicate groups...</p>
-        ) : duplicateGroups.length === 0 ? (
-          <p>No duplicate groups yet.</p>
-        ) : (
-          <div style={{ display: "grid", gap: 16 }}>
-            {duplicateGroups.map((group) => (
-              <article key={group.id} style={{ padding: 16, border: "1px solid #cbd5e1", borderRadius: 12, background: "white" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-                  <strong>{group.id}</strong>
-                  {badge(group.canonical_audio_asset_id ? "canonical set" : "canonical pending")}
-                </div>
-                <div>Canonical Audio Asset: {group.canonical_audio_asset_id ?? "pending"}</div>
-                <div>
-                  Members:{" "}
-                  {group.members.map((member) => member.audio_asset_id).join(", ")}
-                </div>
-                <div>
-                  Decisions: {group.decisions.length}
-                </div>
-                {group.decisions.map((decision) => (
-                  <div key={decision.id} style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #e2e8f0" }}>
-                    <div>
-                      {decision.audio_asset_low_id} vs {decision.audio_asset_high_id}
-                    </div>
-                    <div>
-                      {decision.decision} {badge(decision.confidence)} score {decision.similarity_score}
-                    </div>
-                  </div>
-                ))}
-              </article>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section>
-        <h2>Stage Runs</h2>
-        {metricsSummary ? (
-          <p>
-            Dedup metrics: throughput {metricsSummary.deduplication.throughput ?? 0} candidate count{" "}
-            {metricsSummary.deduplication.candidate_count} match rate {metricsSummary.deduplication.match_rate} duplicate ratio{" "}
-            {metricsSummary.deduplication.duplicate_ratio} unique duration {metricsSummary.deduplication.unique_duration_seconds}s failures{" "}
-            {metricsSummary.deduplication.processing_failures}
-          </p>
-        ) : null}
-        {stageRuns === null ? (
-          <p>Loading stage runs...</p>
-        ) : stageRuns.length === 0 ? (
-          <p>No stage runs recorded yet.</p>
-        ) : (
-          <ul>
-            {stageRuns.map((run) => (
-              <li key={run.id}>
-                {run.stage_name} {badge(run.status)} wait {run.queue_wait_ms}ms wall {run.wall_time_ms}ms throughput {run.throughput ?? 0}
-                {run.failure_reason ? <div>Failure: {run.failure_reason}</div> : null}
-                <div>
-                  input {run.input_bytes}B output {run.output_bytes}B duration {run.input_duration_seconds}s cpu {run.cpu_percent ?? "n/a"} mem {run.memory_bytes ?? "n/a"}
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-    </main>
+      <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 20, padding: 20 }}>
+        <aside style={{ background: "white", borderRadius: 20, padding: 16, boxShadow: "0 10px 30px rgba(15,23,42,0.08)" }}>
+          <nav style={{ display: "grid", gap: 8 }}>
+            <SideLink to={`/projects/${selectedProjectId}/sources`}>منابع</SideLink>
+            <SideLink to={`/projects/${selectedProjectId}/upload`}>بارگذاری فایل</SideLink>
+            <SideLink to={`/projects/${selectedProjectId}/import`}>درون‌ریزی دیتاست</SideLink>
+          </nav>
+        </aside>
+        <main>{children}</main>
+      </div>
+    </div>
   );
+}
+
+function SideLink({ to, children }: { to: string; children: React.ReactNode }) {
+  return <NavLink to={to} style={({ isActive }) => ({ padding: 12, borderRadius: 14, textDecoration: "none", background: isActive ? "#0f172a" : "#f8fafc", color: isActive ? "white" : "#0f172a" })}>{children}</NavLink>;
+}
+
+function SourcesPage() {
+  const { projectId = "" } = useParams();
+  const [sources, setSources] = useState<Source[] | null>(null);
+  const [filter, setFilter] = useState("");
+  const [error, setError] = useState("");
+  const load = () => fetchProjectSources(baseUrl, projectId).then(setSources).catch((err) => setError(err.message));
+  useEffect(() => { load(); }, [projectId]);
+  const filtered = useMemo(() => (sources ?? []).filter((s) => !filter || s.source_type.includes(filter) || s.ingestion_status.includes(filter) || (s.failure_summary ?? "").includes(filter)), [sources, filter]);
+  return <section style={{ background: "white", borderRadius: 20, padding: 20 }}><div style={{ display: "flex", gap: 12, alignItems: "center" }}><h2 style={{ margin: 0 }}>منابع</h2><input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="فیلتر..." style={{ padding: 10, borderRadius: 12, flex: 1 }} /><button onClick={load}>بازنشانی</button></div>{error ? <p>{error}</p> : null}{sources === null ? <p>در حال بارگذاری...</p> : filtered.length === 0 ? <p>منبعی یافت نشد.</p> : <div style={{ display: "grid", gap: 12, marginTop: 16 }}>{filtered.map((s) => <article key={s.id} style={{ padding: 16, border: "1px solid #e2e8f0", borderRadius: 16 }}><div>{s.source_type}</div><div>{s.original_url ?? "بدون آدرس"}</div><div>{s.ingestion_status}</div>{s.failure_summary ? <div style={{ color: "#b91c1c" }}>{s.failure_summary}</div> : null}</article>)}</div>}</section>;
+}
+
+function UploadPage() {
+  const { projectId = "" } = useParams();
+  const [progress, setProgress] = useState(0);
+  const [message, setMessage] = useState("");
+  const submit = (endpoint: string) => (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const file = (event.currentTarget.elements.namedItem("file") as HTMLInputElement).files?.[0];
+    if (!file) { setMessage("یک فایل انتخاب کنید."); return; }
+    const xhr = new XMLHttpRequest();
+    xhr.upload.onprogress = (e) => setProgress(e.lengthComputable ? Math.round((e.loaded / e.total) * 100) : 0);
+    xhr.onload = () => setMessage(xhr.status < 400 ? "بارگذاری با موفقیت انجام شد." : "خطا در بارگذاری");
+    xhr.open("POST", `${baseUrl}/projects/${projectId}/${endpoint}`);
+    const data = new FormData();
+    data.append("file", file);
+    xhr.send(data);
+  };
+  return <section style={{ background: "white", borderRadius: 20, padding: 20, display: "grid", gap: 20 }}><h2 style={{ margin: 0 }}>بارگذاری فایل</h2><form onSubmit={submit("uploads/media")}><input name="file" type="file" accept=".wav,.mp3,.m4a,.mp4,.mkv,.webm,.flac,.ogg,.aac" /><button type="submit">بارگذاری رسانه</button></form><form onSubmit={submit("uploads/archive")}><input name="file" type="file" accept=".zip,.tar,.gz,.tgz" /><button type="submit">بارگذاری آرشیو</button></form><div>پیشرفت: {progress}%</div><div>{message}</div></section>;
+}
+
+function ImportPage() {
+  const { projectId = "" } = useParams();
+  const [summary, setSummary] = useState<string>("");
+  const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const file = (e.currentTarget.elements.namedItem("file") as HTMLInputElement).files?.[0];
+    const audioPathField = (e.currentTarget.elements.namedItem("audio_path_field") as HTMLInputElement).value || "audio_path";
+    if (!file) return;
+    const data = new FormData();
+    data.append("file", file);
+    data.append("audio_path_field", audioPathField);
+    fetch(`${baseUrl}/projects/${projectId}/datasets/import`, { method: "POST", body: data }).then((r) => r.json()).then((json) => setSummary(JSON.stringify(json, null, 2)));
+  };
+  return <section style={{ background: "white", borderRadius: 20, padding: 20 }}><h2>درون‌ریزی دیتاست</h2><form onSubmit={handleSubmit} style={{ display: "grid", gap: 12 }}><input name="file" type="file" accept=".csv,.jsonl,.json,.parquet,.zip,.tar,.gz,.tgz" /><input name="audio_path_field" placeholder="audio_path" /><button type="submit">درون‌ریزی</button></form><pre style={{ whiteSpace: "pre-wrap" }}>{summary}</pre></section>;
 }
 
 export function App() {
-  return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="*" element={<DashboardPage />} />
-      </Routes>
-    </BrowserRouter>
-  );
+  return <BrowserRouter><Routes><Route path="/" element={<Navigate to="/projects" replace />} /><Route path="/projects" element={<WorkspaceShell><div /></WorkspaceShell>} /><Route path="/projects/:projectId" element={<WorkspaceShell><Navigate to="sources" replace /></WorkspaceShell>} /><Route path="/projects/:projectId/sources" element={<WorkspaceShell><SourcesPage /></WorkspaceShell>} /><Route path="/projects/:projectId/upload" element={<WorkspaceShell><UploadPage /></WorkspaceShell>} /><Route path="/projects/:projectId/import" element={<WorkspaceShell><ImportPage /></WorkspaceShell>} /><Route path="*" element={<Navigate to="/projects" replace />} /></Routes></BrowserRouter>;
 }

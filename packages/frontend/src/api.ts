@@ -23,6 +23,14 @@ export type Source = {
   failure_summary?: string | null;
 };
 
+export type DatasetImportSummary = {
+  imported: number;
+  duplicate: number;
+  invalid: number;
+  failed: number;
+  row_failures: Array<{ row: number; reason: string }>;
+};
+
 export type Job = {
   id: string;
   project_id: string;
@@ -196,6 +204,26 @@ export async function importCsv(baseUrl: string, projectId: string, path: string
     method: "POST",
     body: JSON.stringify({ path }),
   });
+}
+
+export async function uploadMedia(baseUrl: string, projectId: string, file: File) {
+  const body = new FormData();
+  body.append("file", file);
+  return fetch(`${baseUrl}/projects/${projectId}/uploads/media`, { method: "POST", body });
+}
+
+export async function uploadArchive(baseUrl: string, projectId: string, file: File) {
+  const body = new FormData();
+  body.append("file", file);
+  return fetch(`${baseUrl}/projects/${projectId}/uploads/archive`, { method: "POST", body });
+}
+
+export async function importDataset(baseUrl: string, projectId: string, file: File, audioPathField: string) {
+  const body = new FormData();
+  body.append("file", file);
+  body.append("audio_path_field", audioPathField);
+  const response = await fetch(`${baseUrl}/projects/${projectId}/datasets/import`, { method: "POST", body });
+  return response.json() as Promise<DatasetImportSummary>;
 }
 
 export async function retryJob(baseUrl: string, projectId: string, jobId: string) {

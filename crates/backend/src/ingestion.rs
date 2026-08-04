@@ -26,6 +26,13 @@ pub struct CsvImportSummary {
     pub duplicate: u32,
     pub invalid: u32,
     pub failed: u32,
+    pub row_failures: Vec<RowFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFailure {
+    pub row: u32,
+    pub reason: String,
 }
 
 pub async fn register_local_file(
@@ -222,12 +229,17 @@ pub async fn import_csv_urls(
         duplicate: 0,
         invalid: 0,
         failed: 0,
+        row_failures: Vec::new(),
     };
-    for record in reader.records() {
+    for (index, record) in reader.records().enumerate() {
         let record = match record {
             Ok(record) => record,
             Err(_) => {
                 summary.failed += 1;
+                summary.row_failures.push(RowFailure {
+                    row: (index + 2) as u32,
+                    reason: "invalid CSV row".to_string(),
+                });
                 continue;
             }
         };
@@ -239,6 +251,10 @@ pub async fn import_csv_urls(
             Some(url) => {
                 if validate_public_url(url).is_err() {
                     summary.invalid += 1;
+                    summary.row_failures.push(RowFailure {
+                        row: (index + 2) as u32,
+                        reason: "invalid url".to_string(),
+                    });
                     continue;
                 }
                 let normalized_identity = format!("url:{}", normalize_public_url(url));
@@ -250,10 +266,22 @@ pub async fn import_csv_urls(
                 match register_public_url(database, project_id, url).await {
                     Ok(_) if existed => summary.duplicate += 1,
                     Ok(_) => summary.imported += 1,
-                    Err(_) => summary.failed += 1,
+                    Err(err) => {
+                        summary.failed += 1;
+                        summary.row_failures.push(RowFailure {
+                            row: (index + 2) as u32,
+                            reason: err.to_string(),
+                        });
+                    }
                 }
             }
-            None => summary.invalid += 1,
+            None => {
+                summary.invalid += 1;
+                summary.row_failures.push(RowFailure {
+                    row: (index + 2) as u32,
+                    reason: "missing url".to_string(),
+                });
+            }
         }
     }
     Ok(summary)
