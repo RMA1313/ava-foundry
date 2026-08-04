@@ -1,0 +1,41 @@
+[
+  {
+    "stage_name": "audio_extraction",
+    "status": "completed",
+    "queue_wait_ms": 12,
+    "wall_time_ms": 240,
+    "input_bytes": 104857600,
+    "output_bytes": 26214400,
+    "input_duration_seconds": 1200.0,
+    "throughput": 5.0,
+    "cpu_percent": 71.5,
+    "memory_bytes": 134217728,
+    "storage_bytes": 26214400
+  },
+  {
+    "stage_name": "audio_validation",
+    "status": "completed",
+    "queue_wait_ms": 8,
+    "wall_time_ms": 180,
+    "input_bytes": 26214400,
+    "output_bytes": 26214400,
+    "input_duration_seconds": 1200.0,
+    "throughput": 6.6666666667,
+    "cpu_percent": 58.0,
+    "memory_bytes": 100663296,
+    "storage_bytes": 26214400
+  },
+  {
+    "stage_name": "duplicate_detection",
+    "status": "completed",
+    "queue_wait_ms": 15,
+    "wall_time_ms": 95,
+    "input_bytes": 26214400,
+    "output_bytes": 0,
+    "input_duration_seconds": 1200.0,
+    "throughput": 12.6315789474,
+    "cpu_percent": 44.0,
+    "memory_bytes": 83886080,
+    "storage_bytes": 0
+  }
+]

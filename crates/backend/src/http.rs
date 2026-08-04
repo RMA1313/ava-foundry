@@ -1,11 +1,14 @@
 use axum::{
     extract::{multipart::Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Instant;
+use tracing::{info_span, Instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -399,7 +402,42 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id/uploads/media", post(upload_media))
         .route("/projects/:id/uploads/archive", post(upload_archive))
         .route("/projects/:id/datasets/import", post(import_dataset))
+        .layer(middleware::from_fn(request_logging_layer))
         .with_state(state)
+}
+
+async fn request_logging_layer(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> axum::response::Response {
+    let request_id = Uuid::new_v4();
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = Instant::now();
+    let span = info_span!(
+        "http.request",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        project_id = tracing::field::Empty,
+        source_id = tracing::field::Empty,
+        job_id = tracing::field::Empty,
+        stage_id = tracing::field::Empty,
+    );
+    async move {
+        let response = next.run(req).await;
+        tracing::info!(
+            request_id = %request_id,
+            method = %method,
+            path = %path,
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "http request completed"
+        );
+        response
+    }
+    .instrument(span)
+    .await
 }
 
 async fn live() -> Json<StatusResponse> {

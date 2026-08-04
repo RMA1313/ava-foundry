@@ -11,6 +11,7 @@ pub mod hf_adapter;
 pub mod http;
 pub mod ingestion;
 pub mod job;
+pub mod logging;
 pub mod media_asset;
 pub mod migrations;
 pub mod project;

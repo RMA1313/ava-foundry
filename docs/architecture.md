@@ -282,6 +282,17 @@ It visualizes:
 
 The primary business metric is collected audio duration grouped by accounting category.
 
+## Observability
+
+Operational logging is structured and correlation-friendly.
+
+Requirements:
+
+- Backend and worker logs include request, project, source, job, and stage correlation identifiers when available.
+- Log output can be rendered as human-readable console text or JSON for machine ingestion.
+- Pipeline stages record execution timing and outcome details in structured logs.
+- Benchmark runs capture stage latency, throughput, CPU, memory, and storage metrics where available.
+
 ---
 
 # Fault Tolerance

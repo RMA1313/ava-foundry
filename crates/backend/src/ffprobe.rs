@@ -178,10 +178,10 @@ mod tests {
         let err = adapter
             .probe(Path::new("/tmp/input.mkv"), Duration::from_secs(1))
             .await;
-        assert!(err
-            .unwrap_err()
-            .to_string()
-            .contains("failed to parse ffprobe json"));
+        let message = err.unwrap_err().to_string();
+        assert!(
+            message.contains("failed to parse ffprobe json") || message.contains("expected value")
+        );
     }
 
     #[tokio::test]

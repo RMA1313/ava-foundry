@@ -150,6 +150,7 @@ Measure deduplication performance and effectiveness.
 - The backend exposes project-scoped deduplication metrics alongside stage runs.
 - Metrics include throughput, candidate counts, match rate, duplicate ratio, unique duration, and processing failures.
 - Unique duration excludes duplicate-only audio duration from project totals.
+- Benchmark coverage exists for core pipeline stage persistence paths, with regression checks where practical.
 
 ---
 

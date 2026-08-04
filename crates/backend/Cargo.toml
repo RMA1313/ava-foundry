@@ -25,7 +25,12 @@ parquet = { version = "53", features = ["json"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+criterion = { version = "0.5", features = ["async_tokio"] }
 predicates = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower = "0.5"
+
+[[bench]]
+name = "pipeline"
+harness = false

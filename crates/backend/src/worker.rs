@@ -15,7 +15,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{Duration, Utc};
 use tokio::{sync::Semaphore, task::JoinSet};
-use tracing::info;
+use tracing::{info, instrument};
 
 use crate::{
     config::AudioNormalizationProfile,
@@ -2362,6 +2362,16 @@ mod tests {
     }
 }
 
+#[instrument(
+    skip(state, ffmpeg_path),
+    fields(
+        request_id = tracing::field::Empty,
+        project_id = tracing::field::Empty,
+        source_id = tracing::field::Empty,
+        job_id = %job.id,
+        stage_name = "audio_extraction"
+    )
+)]
 async fn handle_audio_extraction_job(
     state: &AppState,
     job: Job,
@@ -2608,6 +2618,16 @@ async fn persist_audio_extraction_state(
     Ok(())
 }
 
+#[instrument(
+    skip(state, ffmpeg_path, ffprobe_path),
+    fields(
+        request_id = tracing::field::Empty,
+        project_id = tracing::field::Empty,
+        source_id = tracing::field::Empty,
+        job_id = %job.id,
+        stage_name = "audio_validation"
+    )
+)]
 async fn handle_audio_validation_job(
     state: &AppState,
     job: Job,
@@ -3336,7 +3356,36 @@ fn optional_memory_bytes() -> Option<i64> {
 }
 
 async fn record_stage_run(database: &crate::db::Database, run: StageRun) -> Result<()> {
+    let stage_name = run.stage_name.clone();
+    let status = run.status.clone();
+    let project_id = run.project_id;
+    let job_id = run.job_id;
+    let media_asset_id = run.media_asset_id;
+    let audio_asset_id = run.audio_asset_id;
+    let queue_wait_ms = run.queue_wait_ms;
+    let wall_time_ms = run.wall_time_ms;
+    let input_bytes = run.input_bytes;
+    let output_bytes = run.output_bytes;
+    let throughput = run.throughput;
+    let cpu_percent = run.cpu_percent;
+    let memory_bytes = run.memory_bytes;
     let _ = database.stage_runs().insert(database.pool(), run).await?;
+    info!(
+        project_id = %project_id,
+        job_id = ?job_id,
+        media_asset_id = ?media_asset_id,
+        audio_asset_id = ?audio_asset_id,
+        stage_name = %stage_name,
+        status = %status,
+        queue_wait_ms,
+        wall_time_ms,
+        input_bytes,
+        output_bytes,
+        throughput = ?throughput,
+        cpu_percent = ?cpu_percent,
+        memory_bytes = ?memory_bytes,
+        "recorded stage run"
+    );
     Ok(())
 }
 

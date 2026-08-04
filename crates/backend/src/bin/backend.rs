@@ -5,6 +5,7 @@ use anyhow::Result;
 use backend::{
     config::AppConfig,
     db::Database,
+    logging,
     server::{self, AppState},
     storage::AudioStorageConfig,
     worker::{
@@ -16,6 +17,7 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    logging::init();
     let config = AppConfig::load_from_env()?;
     let database = Database::connect(&config.database_url).await?;
     let recovered = database
