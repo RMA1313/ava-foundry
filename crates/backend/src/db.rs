@@ -17,6 +17,10 @@ impl Database {
         Ok(Self { pool })
     }
 
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

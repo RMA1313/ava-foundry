@@ -75,6 +75,23 @@ impl ProjectRepository {
         rows.iter().map(project_from_row).collect()
     }
 
+    pub async fn list_paginated(&self, limit: i64, offset: i64) -> Result<Vec<Project>> {
+        let rows = sqlx::query(
+            r#"
+            select id, name, description, created_at, updated_at
+            from projects
+            order by created_at asc, id asc
+            limit $1 offset $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(project_from_row).collect()
+    }
+
     pub async fn update(
         &self,
         id: Uuid,
@@ -141,5 +158,11 @@ mod tests {
     #[test]
     fn project_names_cannot_be_empty() {
         assert!(validate_name("   ").is_err());
+    }
+
+    #[test]
+    fn project_names_are_limited_to_120_characters() {
+        let long_name = "a".repeat(121);
+        assert!(validate_name(&long_name).is_err());
     }
 }
