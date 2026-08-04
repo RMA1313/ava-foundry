@@ -108,6 +108,14 @@ Python:
 pytest
 ```
 
+Local bootstrap and stack commands:
+
+```bash
+pnpm install
+docker compose up -d postgres
+just check
+```
+
 ---
 
 # Pipeline Rules

@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: data_studio
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d data_studio"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      DATA_STUDIO_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/data_studio
+      DATA_STUDIO_WORKSPACE_DIR: /workspace
+      DATA_STUDIO_DATA_DIR: /workspace/data
+      DATA_STUDIO_TEMP_DIR: /workspace/data/tmp
+      DATA_STUDIO_HOST: 0.0.0.0
+      DATA_STUDIO_PORT: 8080
+    volumes:
+      - .:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    environment:
+      VITE_API_BASE_URL: http://backend:8080
+    volumes:
+      - .:/workspace
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "5173:5173"
+
+  inference-worker:
+    build:
+      context: .
+      dockerfile: docker/inference-worker.Dockerfile
+    environment:
+      DATA_STUDIO_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/data_studio
+      DATA_STUDIO_WORKSPACE_DIR: /workspace
+      DATA_STUDIO_DATA_DIR: /workspace/data
+      DATA_STUDIO_TEMP_DIR: /workspace/data/tmp
+      DATA_STUDIO_INFERENCE_HOST: 0.0.0.0
+      DATA_STUDIO_INFERENCE_PORT: 8090
+    volumes:
+      - .:/workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8090:8090"
+
+volumes:
+  postgres-data:
+
