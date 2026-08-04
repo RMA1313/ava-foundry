@@ -72,6 +72,15 @@ export type StageRun = {
   memory_bytes?: number | null;
 };
 
+export type DeduplicationMetrics = {
+  throughput?: number | null;
+  candidate_count: number;
+  match_rate: number;
+  duplicate_ratio: number;
+  unique_duration_seconds: number;
+  processing_failures: number;
+};
+
 export type DuplicateDecision = {
   id: string;
   audio_asset_low_id: string;
@@ -104,6 +113,11 @@ export type DuplicateGroup = {
   updated_at: string;
   members: DuplicateGroupMember[];
   decisions: DuplicateDecision[];
+};
+
+export type MetricsSummary = {
+  stage_runs: StageRun[];
+  deduplication: DeduplicationMetrics;
 };
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -147,9 +161,8 @@ export async function fetchProjectAudioAssets(baseUrl: string, projectId: string
   return body.items;
 }
 
-export async function fetchProjectMetricsSummary(baseUrl: string, projectId: string): Promise<StageRun[]> {
-  const body = await requestJson<{ stage_runs: StageRun[] }>(`${baseUrl}/projects/${projectId}/metrics/summary`);
-  return body.stage_runs;
+export async function fetchProjectMetricsSummary(baseUrl: string, projectId: string): Promise<MetricsSummary> {
+  return requestJson<MetricsSummary>(`${baseUrl}/projects/${projectId}/metrics/summary`);
 }
 
 export async function fetchProjectDuplicateGroups(baseUrl: string, projectId: string): Promise<DuplicateGroup[]> {

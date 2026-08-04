@@ -8,6 +8,7 @@ import {
   fetchProjectMetricsSummary,
   type AudioAsset,
   type DuplicateGroup,
+  type MetricsSummary,
   type Project,
   type StageRun,
 } from "./api";
@@ -24,6 +25,7 @@ function DashboardPage() {
   const [audioAssets, setAudioAssets] = useState<AudioAsset[] | null>(null);
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[] | null>(null);
   const [stageRuns, setStageRuns] = useState<StageRun[] | null>(null);
+  const [metricsSummary, setMetricsSummary] = useState<MetricsSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -40,7 +42,8 @@ function DashboardPage() {
     ]);
     setAudioAssets(nextAssets);
     setDuplicateGroups(nextGroups);
-    setStageRuns(nextRuns);
+    setStageRuns(nextRuns.stage_runs);
+    setMetricsSummary(nextRuns);
     setError(null);
   }
 
@@ -66,12 +69,14 @@ function DashboardPage() {
       setAudioAssets(null);
       setDuplicateGroups(null);
       setStageRuns(null);
+      setMetricsSummary(null);
       return;
     }
     let cancelled = false;
     setAudioAssets(null);
     setDuplicateGroups(null);
     setStageRuns(null);
+    setMetricsSummary(null);
     setRefreshing(true);
     refreshProjectData(selectedProjectId)
       .catch(() => {
@@ -200,6 +205,14 @@ function DashboardPage() {
 
       <section>
         <h2>Stage Runs</h2>
+        {metricsSummary ? (
+          <p>
+            Dedup metrics: throughput {metricsSummary.deduplication.throughput ?? 0} candidate count{" "}
+            {metricsSummary.deduplication.candidate_count} match rate {metricsSummary.deduplication.match_rate} duplicate ratio{" "}
+            {metricsSummary.deduplication.duplicate_ratio} unique duration {metricsSummary.deduplication.unique_duration_seconds}s failures{" "}
+            {metricsSummary.deduplication.processing_failures}
+          </p>
+        ) : null}
         {stageRuns === null ? (
           <p>Loading stage runs...</p>
         ) : stageRuns.length === 0 ? (

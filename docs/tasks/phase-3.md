@@ -145,6 +145,12 @@ The dashboard renders duplicate-group loading, empty, error, and polling states 
 
 Measure deduplication performance and effectiveness.
 
+### Acceptance Criteria
+
+- The backend exposes project-scoped deduplication metrics alongside stage runs.
+- Metrics include throughput, candidate counts, match rate, duplicate ratio, unique duration, and processing failures.
+- Unique duration excludes duplicate-only audio duration from project totals.
+
 ---
 
 ## P3-14 — End-to-End Tests
@@ -152,6 +158,12 @@ Measure deduplication performance and effectiveness.
 ### Goal
 
 Validate the complete deduplication pipeline.
+
+### Acceptance Criteria
+
+- Phase 3 is covered by local-fixture end-to-end tests.
+- Tests verify fingerprint generation, indexing, candidate search, similarity evaluation, duplicate decisions, grouping, canonical selection, recovery, API responses, and dashboard-visible state.
+- Tests verify repeated execution and restart recovery are idempotent.
 
 ---
 

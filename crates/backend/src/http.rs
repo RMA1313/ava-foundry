@@ -215,6 +215,17 @@ struct StageRunResponse {
 #[derive(Serialize)]
 struct MetricsSummaryResponse {
     stage_runs: Vec<StageRunResponse>,
+    deduplication: DeduplicationMetricsResponse,
+}
+
+#[derive(Serialize)]
+struct DeduplicationMetricsResponse {
+    throughput: Option<f64>,
+    candidate_count: i64,
+    match_rate: f64,
+    duplicate_ratio: f64,
+    unique_duration_seconds: f64,
+    processing_failures: i64,
 }
 
 #[derive(Deserialize)]
@@ -602,8 +613,127 @@ async fn metrics_summary(
         .list_by_project(id)
         .await
         .map_err(database_error)?;
+    let throughput = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+        select avg(throughput)
+        from stage_runs
+        where project_id = $1
+          and stage_name = 'duplicate_detection'
+          and status = 'completed'
+          and throughput is not null
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?;
+    let candidate_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)
+        from audio_duplicate_decisions d
+        join audio_assets a on a.id = d.audio_asset_low_id
+        where a.project_id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?;
+    let duplicate_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)
+        from audio_duplicate_decisions d
+        join audio_assets a on a.id = d.audio_asset_low_id
+        where a.project_id = $1
+          and d.decision = 'duplicate'
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?;
+    let unique_duration_seconds = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+        with project_assets as (
+            select a.id, a.duration_seconds, m.duplicate_group_id, g.canonical_audio_asset_id
+            from audio_assets a
+            left join duplicate_group_memberships m on m.audio_asset_id = a.id
+            left join duplicate_groups g on g.id = m.duplicate_group_id
+            where a.project_id = $1
+        )
+        select coalesce(sum(
+            case
+                when duplicate_group_id is null then duration_seconds
+                when canonical_audio_asset_id = id then duration_seconds
+                else 0
+            end
+        ), 0)
+        from project_assets
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?
+    .unwrap_or(0.0);
+    let processing_failures = sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)
+        from stage_runs
+        where project_id = $1
+          and stage_name = 'duplicate_detection'
+          and status = 'failed'
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?;
+    let duplicate_duration_seconds = sqlx::query_scalar::<_, Option<f64>>(
+        r#"
+        with project_assets as (
+            select a.id, a.duration_seconds, m.duplicate_group_id, g.canonical_audio_asset_id
+            from audio_assets a
+            left join duplicate_group_memberships m on m.audio_asset_id = a.id
+            left join duplicate_groups g on g.id = m.duplicate_group_id
+            where a.project_id = $1
+        )
+        select coalesce(sum(
+            case
+                when duplicate_group_id is null then 0
+                when canonical_audio_asset_id = id then 0
+                else duration_seconds
+            end
+        ), 0)
+        from project_assets
+        "#,
+    )
+    .bind(id)
+    .fetch_one(state.database.pool())
+    .await
+    .map_err(|err| database_error(err.into()))?
+    .unwrap_or(0.0);
+    let total_duration_seconds = unique_duration_seconds + duplicate_duration_seconds;
+    let match_rate = if candidate_count > 0 {
+        duplicate_count as f64 / candidate_count as f64
+    } else {
+        0.0
+    };
+    let duplicate_ratio = if total_duration_seconds > 0.0 {
+        duplicate_duration_seconds / total_duration_seconds
+    } else {
+        0.0
+    };
     Ok(Json(MetricsSummaryResponse {
         stage_runs: runs.into_iter().map(stage_run_response).collect(),
+        deduplication: DeduplicationMetricsResponse {
+            throughput,
+            candidate_count,
+            match_rate,
+            duplicate_ratio,
+            unique_duration_seconds,
+            processing_failures,
+        },
     }))
 }
 
