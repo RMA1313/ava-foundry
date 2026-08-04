@@ -14,6 +14,10 @@ pub struct MediaAsset {
     pub byte_size: i64,
     pub ingestion_status: String,
     pub inspection_status: Option<String>,
+    pub extraction_status: Option<String>,
+    pub extraction_progress: Option<String>,
+    pub extraction_tmp_path: Option<String>,
+    pub extracted_at: Option<DateTime<Utc>>,
     pub container_format: Option<String>,
     pub duration_seconds: Option<f64>,
     pub codecs: Option<String>,
@@ -34,6 +38,10 @@ pub struct MediaAssetUpsert {
     pub byte_size: i64,
     pub ingestion_status: String,
     pub inspection_status: Option<String>,
+    pub extraction_status: Option<String>,
+    pub extraction_progress: Option<String>,
+    pub extraction_tmp_path: Option<String>,
+    pub extracted_at: Option<DateTime<Utc>>,
     pub container_format: Option<String>,
     pub duration_seconds: Option<f64>,
     pub codecs: Option<String>,
@@ -66,10 +74,12 @@ impl MediaAssetRepository {
             insert into media_assets (
                 id, project_id, source_id, media_kind, staged_path,
                 original_filename, byte_size, ingestion_status,
-                inspection_status, container_format, duration_seconds, codecs,
-                sample_rate_hz, channels, inspected_at, created_at, updated_at
+                inspection_status, extraction_status, extraction_progress,
+                extraction_tmp_path, extracted_at, container_format,
+                duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
+                created_at, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now())
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, now(), now())
             on conflict (source_id)
             do update set
                 project_id = excluded.project_id,
@@ -79,6 +89,10 @@ impl MediaAssetRepository {
                 byte_size = excluded.byte_size,
                 ingestion_status = excluded.ingestion_status,
                 inspection_status = excluded.inspection_status,
+                extraction_status = excluded.extraction_status,
+                extraction_progress = excluded.extraction_progress,
+                extraction_tmp_path = excluded.extraction_tmp_path,
+                extracted_at = excluded.extracted_at,
                 container_format = excluded.container_format,
                 duration_seconds = excluded.duration_seconds,
                 codecs = excluded.codecs,
@@ -88,8 +102,9 @@ impl MediaAssetRepository {
                 updated_at = excluded.updated_at
             returning id, project_id, source_id, media_kind, staged_path,
                       original_filename, byte_size, ingestion_status,
-                      inspection_status, container_format, duration_seconds, codecs,
-                      sample_rate_hz, channels, inspected_at,
+                      inspection_status, extraction_status, extraction_progress,
+                      extraction_tmp_path, extracted_at, container_format,
+                      duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
                       created_at, updated_at
             "#,
         )
@@ -102,6 +117,10 @@ impl MediaAssetRepository {
         .bind(request.byte_size)
         .bind(request.ingestion_status.as_str())
         .bind(request.inspection_status.as_deref())
+        .bind(request.extraction_status.as_deref())
+        .bind(request.extraction_progress.as_deref())
+        .bind(request.extraction_tmp_path.as_deref())
+        .bind(request.extracted_at)
         .bind(request.container_format.as_deref())
         .bind(request.duration_seconds)
         .bind(request.codecs.as_deref())
@@ -118,14 +137,34 @@ impl MediaAssetRepository {
             r#"
             select id, project_id, source_id, media_kind, staged_path,
                    original_filename, byte_size, ingestion_status,
-                   inspection_status, container_format, duration_seconds, codecs,
-                   sample_rate_hz, channels, inspected_at,
+                   inspection_status, extraction_status, extraction_progress,
+                   extraction_tmp_path, extracted_at, container_format,
+                   duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
                    created_at, updated_at
             from media_assets
             where source_id = $1
             "#,
         )
         .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(media_asset_from_row).transpose()
+    }
+
+    pub async fn get(&self, id: Uuid) -> Result<Option<MediaAsset>> {
+        let row = sqlx::query(
+            r#"
+            select id, project_id, source_id, media_kind, staged_path,
+                   original_filename, byte_size, ingestion_status,
+                   inspection_status, extraction_status, extraction_progress,
+                   extraction_tmp_path, extracted_at, container_format,
+                   duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
+                   created_at, updated_at
+            from media_assets
+            where id = $1
+            "#,
+        )
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(media_asset_from_row).transpose()
@@ -143,6 +182,10 @@ fn media_asset_from_row(row: &PgRow) -> Result<MediaAsset> {
         byte_size: row.try_get("byte_size")?,
         ingestion_status: row.try_get("ingestion_status")?,
         inspection_status: row.try_get("inspection_status")?,
+        extraction_status: row.try_get("extraction_status")?,
+        extraction_progress: row.try_get("extraction_progress")?,
+        extraction_tmp_path: row.try_get("extraction_tmp_path")?,
+        extracted_at: row.try_get("extracted_at")?,
         container_format: row.try_get("container_format")?,
         duration_seconds: row.try_get("duration_seconds")?,
         codecs: row.try_get("codecs")?,

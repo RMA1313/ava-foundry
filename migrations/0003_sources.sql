@@ -23,6 +23,10 @@ create table if not exists media_assets (
     original_filename text,
     byte_size bigint not null,
     ingestion_status text not null,
+    extraction_status text,
+    extraction_progress text,
+    extraction_tmp_path text,
+    extracted_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );

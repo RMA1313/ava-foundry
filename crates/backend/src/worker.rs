@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -16,6 +18,7 @@ use tracing::info;
 
 use crate::{
     download::DownloadCommandAdapter,
+    ffmpeg::FfmpegAdapter,
     ffprobe::{FfprobeAdapter, FfprobeOutput},
     ingestion,
     job::{Job, JobType},
@@ -329,6 +332,7 @@ impl WorkerRuntime {
                 failure_reason,
                 retry_after,
             } => {
+                let _ = state.database.jobs().fail(job.id, &failure_reason).await?;
                 let _ = state
                     .database
                     .jobs()
@@ -357,6 +361,14 @@ pub fn media_inspection_handler(ffprobe_path: impl Into<PathBuf>) -> impl JobHan
     move |job: Job, state: AppState| {
         let ffprobe_path = ffprobe_path.clone();
         async move { handle_media_inspection_job(&state, job, &ffprobe_path).await }
+    }
+}
+
+pub fn audio_extraction_handler(ffmpeg_path: impl Into<PathBuf>) -> impl JobHandler {
+    let ffmpeg_path = ffmpeg_path.into();
+    move |job: Job, state: AppState| {
+        let ffmpeg_path = ffmpeg_path.clone();
+        async move { handle_audio_extraction_job(&state, job, &ffmpeg_path).await }
     }
 }
 
@@ -530,6 +542,10 @@ async fn persist_media_inspection(
                     byte_size: media_asset.byte_size,
                     ingestion_status: media_asset.ingestion_status.clone(),
                     inspection_status: Some(inspection_status.to_string()),
+                    extraction_status: media_asset.extraction_status.clone(),
+                    extraction_progress: media_asset.extraction_progress.clone(),
+                    extraction_tmp_path: media_asset.extraction_tmp_path.clone(),
+                    extracted_at: media_asset.extracted_at,
                     container_format,
                     duration_seconds,
                     codecs: Some(
@@ -569,6 +585,10 @@ async fn persist_media_inspection(
                 byte_size: media_asset.byte_size,
                 ingestion_status: media_asset.ingestion_status.clone(),
                 inspection_status: Some(inspection_status.to_string()),
+                extraction_status: media_asset.extraction_status.clone(),
+                extraction_progress: media_asset.extraction_progress.clone(),
+                extraction_tmp_path: media_asset.extraction_tmp_path.clone(),
+                extracted_at: media_asset.extracted_at,
                 container_format,
                 duration_seconds,
                 codecs: Some(
@@ -630,6 +650,10 @@ pub async fn finalize_media_ingestion(
                 byte_size,
                 ingestion_status: "ready".to_string(),
                 inspection_status: None,
+                extraction_status: None,
+                extraction_progress: None,
+                extraction_tmp_path: None,
+                extracted_at: None,
                 container_format: None,
                 duration_seconds: None,
                 codecs: None,
@@ -987,6 +1011,32 @@ mod tests {
         (project_id, source_id, media_asset_id)
     }
 
+    async fn seed_inspectable_media_asset(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let (project_id, source_id, media_asset_id) = seed_media_asset(pool).await;
+        sqlx::query(
+            r#"
+            update media_assets
+            set inspection_status = 'inspectable',
+                updated_at = now()
+            where id = $1
+            "#,
+        )
+        .bind(media_asset_id)
+        .execute(pool)
+        .await
+        .expect("media asset should update");
+        (project_id, source_id, media_asset_id)
+    }
+
+    fn fake_ffmpeg(dir: &TempDir, script: &str) -> PathBuf {
+        let path = dir.path().join("fake-ffmpeg");
+        fs::write(&path, script).expect("script should write");
+        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("permissions");
+        path
+    }
+
     #[tokio::test]
     async fn worker_runtime_persists_inspected_media_metadata() {
         clear_env();
@@ -1122,6 +1172,141 @@ mod tests {
         assert_eq!(second.inspection_status.as_deref(), Some("no_audio_stream"));
     }
 
+    #[tokio::test]
+    async fn worker_runtime_extraction_persists_temporary_output_and_progress() {
+        clear_env();
+        let pool = test_pool().await;
+        let (project_id, source_id, media_asset_id) = seed_inspectable_media_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = TempDir::new().expect("temp dir");
+        let executable = fake_ffmpeg(
+            &temp_dir,
+            "#!/bin/sh\nfor output; do :; done\nprintf 'out_time_ms=1000\\nprogress=continue\\n'\n: > \"$output\"\nprintf 'out_time_ms=2000\\nprogress=end\\n'\n",
+        );
+        let _job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(media_asset_id),
+                JobType::AudioExtraction,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::AudioExtraction,
+            audio_extraction_handler(executable),
+        );
+        let handlers = runtime.handlers.clone();
+        let staging_dir = temp_dir.path().join("staging");
+        runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                    staging_dir: staging_dir.clone(),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                job,
+            )
+            .await
+            .expect("extraction should succeed");
+        let asset = database
+            .media_assets()
+            .get_by_source(source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.extraction_status.as_deref(), Some("completed"));
+        assert_eq!(asset.extraction_progress.as_deref(), Some("progress=end"));
+        assert_eq!(
+            asset.extraction_tmp_path.as_deref(),
+            Some(
+                staging_dir
+                    .join(format!("{}.flac.tmp", media_asset_id))
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert!(staging_dir
+            .join(format!("{}.flac.tmp", media_asset_id))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_removes_abandoned_partial_output_on_retry() {
+        clear_env();
+        let pool = test_pool().await;
+        let (project_id, source_id, media_asset_id) = seed_inspectable_media_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = TempDir::new().expect("temp dir");
+        let executable = fake_ffmpeg(
+            &temp_dir,
+            "#!/bin/sh\nfor output; do :; done\nprintf 'out_time_ms=1000\\nprogress=continue\\n'\nexit 1\n",
+        );
+        let _job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(media_asset_id),
+                JobType::AudioExtraction,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let staging_dir = temp_dir.path().join("staging");
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::AudioExtraction,
+            audio_extraction_handler(executable),
+        );
+        let handlers = runtime.handlers.clone();
+        runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                    staging_dir: staging_dir.clone(),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                job,
+            )
+            .await
+            .expect("retry should be recorded");
+        assert!(!staging_dir
+            .join(format!("{}.flac.tmp", media_asset_id))
+            .exists());
+        let asset = database
+            .media_assets()
+            .get_by_source(source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.extraction_status.as_deref(), Some("failed"));
+        assert_eq!(asset.extraction_tmp_path.as_deref(), None);
+    }
+
     #[test]
     fn staging_capacity_guard_uses_hysteresis() {
         let metrics = FakeFilesystemMetrics::new(5, 10);
@@ -1138,4 +1323,173 @@ mod tests {
         let third = guard.check(Path::new("/tmp")).expect("capacity check");
         assert!(!third.paused);
     }
+}
+
+async fn handle_audio_extraction_job(
+    state: &AppState,
+    job: Job,
+    ffmpeg_path: &Path,
+) -> Result<JobOutcome> {
+    let media_asset_id = job
+        .source_id
+        .ok_or_else(|| anyhow!("audio extraction job requires a media asset id"))?;
+    let media_asset = state
+        .database
+        .media_assets()
+        .get(media_asset_id)
+        .await?
+        .ok_or_else(|| anyhow!("media asset not found"))?;
+    if media_asset.inspection_status.as_deref() != Some("inspectable") {
+        return Ok(JobOutcome::Failed {
+            failure_reason: "media asset is not inspectable".to_string(),
+        });
+    }
+    let adapter = match FfmpegAdapter::new(ffmpeg_path) {
+        Ok(adapter) => adapter,
+        Err(err) => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+    };
+    let temp_path = state
+        .staging_dir
+        .join(format!("{}.flac.tmp", media_asset_id));
+    if let Some(parent) = temp_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    persist_audio_extraction_state(
+        &state.database,
+        &media_asset,
+        Some("running"),
+        Some("starting"),
+        Some(temp_path.to_string_lossy().as_ref()),
+        None,
+    )
+    .await?;
+    let extraction = adapter
+        .start(Path::new(&media_asset.staged_path), &temp_path)
+        .await;
+    let mut process = match extraction {
+        Ok(process) => process,
+        Err(err) => {
+            let _ = persist_audio_extraction_state(
+                &state.database,
+                &media_asset,
+                Some("failed"),
+                Some(&err.to_string()),
+                None,
+                None,
+            )
+            .await;
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            });
+        }
+    };
+    let mut last_progress = String::new();
+    while let Some(progress) = process.next_progress().await {
+        last_progress = progress.raw.clone();
+        let temp_path_string = temp_path.to_string_lossy().to_string();
+        persist_audio_extraction_state(
+            &state.database,
+            &media_asset,
+            Some("running"),
+            Some(&last_progress),
+            Some(temp_path_string.as_str()),
+            None,
+        )
+        .await?;
+    }
+    let status = process.wait().await;
+    match status {
+        Ok(output) if output.status.success() => {
+            persist_audio_extraction_state(
+                &state.database,
+                &media_asset,
+                Some("completed"),
+                Some(if last_progress.is_empty() {
+                    "completed"
+                } else {
+                    &last_progress
+                }),
+                Some(temp_path.to_string_lossy().as_ref()),
+                Some(Utc::now()),
+            )
+            .await?;
+            Ok(JobOutcome::Completed)
+        }
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            persist_audio_extraction_state(
+                &state.database,
+                &media_asset,
+                Some("failed"),
+                Some("ffmpeg failed"),
+                None,
+                None,
+            )
+            .await?;
+            Ok(JobOutcome::Retry {
+                failure_reason: "ffmpeg failed".to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            persist_audio_extraction_state(
+                &state.database,
+                &media_asset,
+                Some("failed"),
+                Some(&err.to_string()),
+                None,
+                None,
+            )
+            .await?;
+            Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+    }
+}
+
+async fn persist_audio_extraction_state(
+    database: &crate::db::Database,
+    media_asset: &crate::media_asset::MediaAsset,
+    extraction_status: Option<&str>,
+    extraction_progress: Option<&str>,
+    extraction_tmp_path: Option<&str>,
+    extracted_at: Option<chrono::DateTime<Utc>>,
+) -> Result<()> {
+    let _ = database
+        .media_assets()
+        .upsert_ingested(
+            database.pool(),
+            crate::media_asset::MediaAssetUpsert {
+                project_id: media_asset.project_id,
+                source_id: media_asset.source_id,
+                media_kind: media_asset.media_kind.clone(),
+                staged_path: media_asset.staged_path.clone(),
+                original_filename: media_asset.original_filename.clone(),
+                byte_size: media_asset.byte_size,
+                ingestion_status: media_asset.ingestion_status.clone(),
+                inspection_status: media_asset.inspection_status.clone(),
+                extraction_status: extraction_status.map(str::to_string),
+                extraction_progress: extraction_progress.map(str::to_string),
+                extraction_tmp_path: extraction_tmp_path.map(str::to_string),
+                extracted_at,
+                container_format: media_asset.container_format.clone(),
+                duration_seconds: media_asset.duration_seconds,
+                codecs: media_asset.codecs.clone(),
+                sample_rate_hz: media_asset.sample_rate_hz,
+                channels: media_asset.channels,
+                inspected_at: media_asset.inspected_at,
+            },
+        )
+        .await?;
+    Ok(())
 }
