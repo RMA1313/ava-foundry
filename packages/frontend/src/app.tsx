@@ -1,9 +1,11 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
+  createProject,
   fetchLiveness,
   fetchProject,
   fetchProjects,
+  fetchAudioAsset,
   fetchProjectAudioAssets,
   fetchProjectDuplicateGroups,
   fetchProjectJobs,
@@ -11,12 +13,17 @@ import {
   fetchProjectMetricsSummary,
   fetchProjectSources,
   importDataset,
+  importCsv,
   pausePipeline,
   recoverDuplicates,
   recoverJobs,
   registerUrl,
+  registerFolder,
+  registerLocalFile,
   resumePipeline,
   retryJob,
+  uploadArchive,
+  uploadMedia,
   updateProject,
   type AudioAsset,
   type DuplicateGroup,
@@ -88,7 +95,8 @@ function WorkspaceShell({ children }: { children: ReactNode }) {
         </div>
         <div style={projectPicker}>
           <label style={fieldLabel} htmlFor="project-switcher">پروژه فعال</label>
-          <select id="project-switcher" value={selectedProjectId} onChange={(e) => navigate(`/projects/${e.target.value}/sources`)} style={projectSelect}>
+          <select id="project-switcher" value={selectedProjectId} onChange={(e) => navigate(e.target.value ? `/projects/${e.target.value}/sources` : "/projects/new")} style={projectSelect}>
+            <option value="">پروژه تازه</option>
             {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
           </select>
         </div>
@@ -100,8 +108,14 @@ function WorkspaceShell({ children }: { children: ReactNode }) {
           <div style={sidebarProject}>{projects.find((project) => project.id === selectedProjectId)?.name ?? "بدون پروژه"}</div>
         </div>
         <nav style={navGrid} aria-label="ناوبری فضای کاری">
+            <SideLink to="/projects/new">پروژه جدید</SideLink>
             <SideLink to={`${projectNavBase}/sources`}>منابع</SideLink>
             <SideLink to={`${projectNavBase}/url-import`}>درون‌ریزی URL</SideLink>
+            <SideLink to={`${projectNavBase}/local-file`}>فایل محلی</SideLink>
+            <SideLink to={`${projectNavBase}/folder-scan`}>اسکن پوشه</SideLink>
+            <SideLink to={`${projectNavBase}/csv-import`}>CSV URL</SideLink>
+            <SideLink to={`${projectNavBase}/upload-media`}>آپلود رسانه</SideLink>
+            <SideLink to={`${projectNavBase}/upload-archive`}>آپلود آرشیو</SideLink>
             <SideLink to={`${projectNavBase}/jobs`}>وظایف</SideLink>
             <SideLink to={`${projectNavBase}/media`}>رسانه</SideLink>
             <SideLink to={`${projectNavBase}/audio`}>صوت</SideLink>
@@ -208,7 +222,16 @@ function defaultError(err: unknown) {
 
 function ProjectsLanding() {
   const { data: projects, loading, error } = usePolling(() => fetchProjects(baseUrl), [], 10000);
-  return <PageFrame title="پروژه‌ها" subtitle="پروژه‌ای را برای ورود به فضای کاری انتخاب کنید." loading={loading} error={error} empty={(projects ?? []).length === 0}><div style={{ display: "grid", gap: 12 }}>{(projects ?? []).map((project) => <article key={project.id} style={card}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start", flexWrap: "wrap" }}><div><h3 style={{ margin: 0 }}>{project.name}</h3><p style={{ margin: "6px 0 0", ...subtleText }}>{project.description ?? "بدون توضیح"}</p></div><NavLink to={`/projects/${project.id}/sources`} style={buttonStyle}>باز کردن</NavLink></div><div style={metaGrid}><span className="technical-inline">ID: {project.id}</span></div></article>)}</div></PageFrame>;
+  return <PageFrame title="پروژه‌ها" subtitle="پروژه‌ای را برای ورود به فضای کاری انتخاب کنید." loading={loading} error={error} empty={(projects ?? []).length === 0}><div style={{ display: "grid", gap: 12 }}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center" }}><p style={{ margin: 0, ...subtleText }}>همه پروژه‌ها در همین صفحه دیده می‌شوند و می‌توانید پروژه تازه بسازید.</p><NavLink to="/projects/new" style={buttonStyle}>پروژه جدید</NavLink></div>{(projects ?? []).map((project) => <article key={project.id} style={card}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "start", flexWrap: "wrap" }}><div><h3 style={{ margin: 0 }}>{project.name}</h3><p style={{ margin: "6px 0 0", ...subtleText }}>{project.description ?? "بدون توضیح"}</p></div><NavLink to={`/projects/${project.id}/sources`} style={buttonStyle}>باز کردن</NavLink></div><div style={metaGrid}><span className="technical-inline">ID: {project.id}</span></div></article>)}</div></PageFrame>;
+}
+
+function ProjectCreatePage() {
+  const navigate = useNavigate();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [state, setState] = useState<"idle" | "saving" | "error">("idle");
+  const [message, setMessage] = useState("");
+  return <PageFrame title="پروژه جدید" subtitle="یک workspace محلی تازه بسازید." loading={false} error={state === "error" ? message : ""} empty={false}><form style={formGrid} onSubmit={async (event) => { event.preventDefault(); const trimmedName = name.trim(); if (!trimmedName) { setState("error"); setMessage("نام پروژه الزامی است."); return; } setState("saving"); setMessage(""); try { const project = await createProject(baseUrl, trimmedName, description.trim() || null); navigate(`/projects/${project.id}/sources`); } catch (err) { setState("error"); setMessage(defaultError(err)); } }}><label style={fieldLabel} htmlFor="new-project-name">نام پروژه</label><input id="new-project-name" value={name} onChange={(e) => setName(e.target.value)} style={inputStyle} /><label style={fieldLabel} htmlFor="new-project-description">توضیح</label><textarea id="new-project-description" value={description} onChange={(e) => setDescription(e.target.value)} style={{ ...inputStyle, minHeight: 120, resize: "vertical" }} /><button type="submit" style={buttonStyle}>{state === "saving" ? "در حال ساخت..." : "ساخت پروژه"}</button></form></PageFrame>;
 }
 
 function SourcesPage() {
@@ -248,6 +271,51 @@ function UrlImportPage() {
     }
   };
   return <PageFrame title="درون‌ریزی URL" subtitle="فقط URLهای پشتیبانی‌شده ثبت می‌شوند." error={state.kind === "error" ? state.message : ""} loading={false} empty={false}><form onSubmit={submit} style={formGrid}><input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://..." style={inputStyle} dir="ltr" /><button type="submit" style={buttonStyle}>ثبت URL</button></form>{state.kind === "success" ? <StateMessage tone="info" title="موفق" message={state.message} /> : null}</PageFrame>;
+}
+
+function LocalFilePage() {
+  const projectId = useProjectId();
+  return <SourcePathForm title="ثبت فایل محلی" subtitle="مسیر یک فایل محلی را برای ingest ثبت کنید." submitLabel="ثبت فایل" onSubmit={async (path) => registerLocalFile(baseUrl, projectId, path)} fieldLabel="مسیر فایل" placeholder="/path/to/media.mp4" />;
+}
+
+function FolderScanPage() {
+  const projectId = useProjectId();
+  return <SourcePathForm title="اسکن پوشه" subtitle="پوشه‌ای را برای کشف رسانه ثبت کنید." submitLabel="اسکن پوشه" onSubmit={async (path) => registerFolder(baseUrl, projectId, path)} fieldLabel="مسیر پوشه" placeholder="/path/to/folder" />;
+}
+
+function CsvImportPage() {
+  const projectId = useProjectId();
+  return <SourcePathForm title="CSV URL Import" subtitle="فایل CSV حاوی URLها را ثبت کنید." submitLabel="درون‌ریزی CSV" onSubmit={async (path) => importCsv(baseUrl, projectId, path)} fieldLabel="مسیر CSV" placeholder="/path/to/urls.csv" />;
+}
+
+function UploadMediaPage() {
+  const projectId = useProjectId();
+  return <UploadForm title="آپلود رسانه" subtitle="فایل رسانه‌ای را در staging ثبت کنید." submitLabel="آپلود رسانه" accept=".mp4,.mkv,.mov,.webm,.mp3,.wav,.flac,.aac,.m4a" onSubmit={async (file) => uploadMedia(baseUrl, projectId, file)} />;
+}
+
+function UploadArchivePage() {
+  const projectId = useProjectId();
+  return <UploadForm title="آپلود آرشیو" subtitle="آرشیو zip/tar/tgz را برای پردازش محلی ثبت کنید." submitLabel="آپلود آرشیو" accept=".zip,.tar,.gz,.tgz" onSubmit={async (file) => uploadArchive(baseUrl, projectId, file)} />;
+}
+
+function AudioDetailPage() {
+  const projectId = useProjectId();
+  const { audioAssetId = "" } = useParams();
+  const { data, loading, error } = usePolling(() => fetchAudioAsset(baseUrl, projectId, audioAssetId), [projectId, audioAssetId], 5000);
+  return <PageFrame title="جزئیات صوت" subtitle="نمایش جزئیات کامل یک audio asset." loading={loading} error={error} empty={!data}><article style={card}><div style={metaGrid}><span style={ltrValueStyle}>ID: {data?.id}</span><span>وضعیت: {data?.processing_status}</span><span>اعتبارسنجی: {data?.validation_status ?? "نامشخص"}</span><span>پروفایل: {data?.normalization_profile ?? "نامشخص"}</span><span>مدت: {formatNumber(data?.duration_seconds ?? 0)}</span><span>فرمت: {data?.audio_format}</span><span>کدک: {data?.codec}</span><span>نرخ نمونه‌برداری: {data?.sample_rate_hz}</span><span>کانال: {data?.channels}</span><span>حجم: {formatBytes(data?.byte_size ?? 0)}</span><span style={ltrValueStyle}>مسیر: {data?.storage_path}</span></div></article></PageFrame>;
+}
+
+function SourcePathForm({ title, subtitle, submitLabel, fieldLabel, placeholder, onSubmit }: { title: string; subtitle: string; submitLabel: string; fieldLabel: string; placeholder: string; onSubmit: (path: string) => Promise<unknown> }) {
+  const [path, setPath] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  return <PageFrame title={title} subtitle={subtitle} loading={false} error={error} empty={false}><form style={formGrid} onSubmit={async (event) => { event.preventDefault(); if (!path.trim()) { setError("مسیر الزامی است."); return; } setError(""); try { const result = await onSubmit(path.trim()); setMessage(JSON.stringify(result, null, 2)); } catch (err) { setError(defaultError(err)); } }}><label style={fieldLabel} htmlFor={`${title}-path`}>{fieldLabel}</label><input id={`${title}-path`} value={path} onChange={(e) => setPath(e.target.value)} placeholder={placeholder} style={{ ...inputStyle, direction: "ltr" }} /><button type="submit" style={buttonStyle}>{submitLabel}</button></form><pre style={{ whiteSpace: "pre-wrap", direction: "ltr", textAlign: "left", marginTop: 12 }}>{message}</pre></PageFrame>;
+}
+
+function UploadForm({ title, subtitle, submitLabel, accept, onSubmit }: { title: string; subtitle: string; submitLabel: string; accept: string; onSubmit: (file: File) => Promise<Response> }) {
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  return <PageFrame title={title} subtitle={subtitle} loading={false} error={error} empty={false}><form style={formGrid} onSubmit={async (event) => { event.preventDefault(); const file = (event.currentTarget.elements.namedItem("file") as HTMLInputElement).files?.[0]; if (!file) { setError("یک فایل انتخاب کنید."); return; } setError(""); try { const response = await onSubmit(file); setMessage(JSON.stringify(await response.json(), null, 2)); } catch (err) { setError(defaultError(err)); } }}><input name="file" type="file" accept={accept} style={inputStyle} /><button type="submit" style={buttonStyle}>{submitLabel}</button></form><pre style={{ whiteSpace: "pre-wrap", direction: "ltr", textAlign: "left", marginTop: 12 }}>{message}</pre></PageFrame>;
 }
 
 function JobsPage() {
@@ -446,7 +514,7 @@ function MediaCard({ asset }: { asset: MediaAsset }) {
 }
 
 function AudioCard({ asset }: { asset: AudioAsset }) {
-  return <article style={card}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}><strong>{asset.audio_format}</strong><StatusBadge tone={asset.processing_status === "validated" ? "success" : asset.processing_status === "failed" ? "danger" : "neutral"}>{asset.processing_status}</StatusBadge></div><div style={metaGrid}><span style={ltrValueStyle}>شناسه رسانه: {asset.media_asset_id}</span><span>اعتبارسنجی: {asset.validation_status ?? "نامشخص"}</span><span>کدک: {asset.codec}</span><span>نرخ نمونه‌برداری: {asset.sample_rate_hz}</span><span>کانال: {asset.channels}</span><span>حجم: {asset.byte_size}</span><span style={ltrValueStyle}>مسیر: {asset.storage_path}</span></div></article>;
+  return <article style={card}><div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap" }}><strong>{asset.audio_format}</strong><StatusBadge tone={asset.processing_status === "validated" ? "success" : asset.processing_status === "failed" ? "danger" : "neutral"}>{asset.processing_status}</StatusBadge></div><div style={metaGrid}><span style={ltrValueStyle}>شناسه رسانه: {asset.media_asset_id}</span><span>اعتبارسنجی: {asset.validation_status ?? "نامشخص"}</span><span>کدک: {asset.codec}</span><span>نرخ نمونه‌برداری: {asset.sample_rate_hz}</span><span>کانال: {asset.channels}</span><span>حجم: {asset.byte_size}</span><span style={ltrValueStyle}>مسیر: {asset.storage_path}</span></div><div style={{ marginTop: 12 }}><NavLink to={`/projects/${asset.project_id}/audio/${asset.id}`} style={ghostButtonStyle}>جزئیات</NavLink></div></article>;
 }
 
 function isTechnicalValue(value: string) {
@@ -468,12 +536,19 @@ export function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<WorkspaceShell><ProjectsLanding /></WorkspaceShell>} />
+        <Route path="/projects/new" element={<WorkspaceShell><ProjectCreatePage /></WorkspaceShell>} />
         <Route path="/projects/:projectId" element={<WorkspaceShell><Navigate to="sources" replace /></WorkspaceShell>} />
         <Route path="/projects/:projectId/sources" element={<WorkspaceShell><SourcesPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/url-import" element={<WorkspaceShell><UrlImportPage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/local-file" element={<WorkspaceShell><LocalFilePage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/folder-scan" element={<WorkspaceShell><FolderScanPage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/csv-import" element={<WorkspaceShell><CsvImportPage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/upload-media" element={<WorkspaceShell><UploadMediaPage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/upload-archive" element={<WorkspaceShell><UploadArchivePage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/jobs" element={<WorkspaceShell><JobsPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/media" element={<WorkspaceShell><MediaPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/audio" element={<WorkspaceShell><AudioPage /></WorkspaceShell>} />
+        <Route path="/projects/:projectId/audio/:audioAssetId" element={<WorkspaceShell><AudioDetailPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/duplicates" element={<WorkspaceShell><DuplicatePage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/statistics" element={<WorkspaceShell><StatisticsPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/pipeline" element={<WorkspaceShell><PipelinePage /></WorkspaceShell>} />

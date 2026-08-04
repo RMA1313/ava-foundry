@@ -185,6 +185,13 @@ export async function fetchProjects(baseUrl: string): Promise<Project[]> {
   return body.items;
 }
 
+export async function createProject(baseUrl: string, name: string, description: string | null) {
+  return requestJson<Project>(`${baseUrl}/projects`, {
+    method: "POST",
+    body: JSON.stringify({ name, description }),
+  });
+}
+
 export async function fetchProject(baseUrl: string, projectId: string): Promise<Project> {
   return requestJson<Project>(`${baseUrl}/projects/${projectId}`);
 }
@@ -279,6 +286,10 @@ export async function uploadArchive(baseUrl: string, projectId: string, file: Fi
   const body = new FormData();
   body.append("file", file);
   return fetch(`${baseUrl}/projects/${projectId}/uploads/archive`, { method: "POST", body });
+}
+
+export async function fetchAudioAsset(baseUrl: string, projectId: string, audioAssetId: string): Promise<AudioAsset> {
+  return requestJson<AudioAsset>(`${baseUrl}/projects/${projectId}/audio-assets/${audioAssetId}`);
 }
 
 export async function importDataset(baseUrl: string, projectId: string, file: File, audioPathField: string) {
