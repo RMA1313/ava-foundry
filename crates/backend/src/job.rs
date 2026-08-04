@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub enum JobType {
     SourceRegistration,
     MediaIngestion,
+    MediaInspection,
     AudioExtraction,
     AudioValidation,
     VideoCleanup,
@@ -22,6 +23,7 @@ impl JobType {
         match self {
             Self::SourceRegistration => "source_registration",
             Self::MediaIngestion => "media_ingestion",
+            Self::MediaInspection => "media_inspection",
             Self::AudioExtraction => "audio_extraction",
             Self::AudioValidation => "audio_validation",
             Self::VideoCleanup => "video_cleanup",
@@ -37,6 +39,7 @@ impl JobType {
         match value {
             "source_registration" => Ok(Self::SourceRegistration),
             "media_ingestion" => Ok(Self::MediaIngestion),
+            "media_inspection" => Ok(Self::MediaInspection),
             "audio_extraction" => Ok(Self::AudioExtraction),
             "audio_validation" => Ok(Self::AudioValidation),
             "video_cleanup" => Ok(Self::VideoCleanup),

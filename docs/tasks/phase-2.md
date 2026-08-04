@@ -139,6 +139,7 @@ Audio-stream detection
 Duration, container, streams, codecs, sample rates, and channels
 Media Asset inspection state
 Retry-safe persistence
+Idempotent technical-metadata persistence on `media_assets`
 Out of Scope
 Audio extraction
 Quality scoring

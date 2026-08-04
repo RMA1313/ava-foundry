@@ -94,7 +94,7 @@ mod tests {
         let executable = dir.path().join("fake");
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$TMPDIR/args.txt\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGS_OUT\"\n",
         )
         .unwrap();
         let mut perms = fs::metadata(&executable).unwrap().permissions();
@@ -103,7 +103,7 @@ mod tests {
         let adapter = DownloadCommandAdapter::new(&executable).unwrap();
         let output_dir = dir.path().join("tmp");
         fs::create_dir_all(&output_dir).unwrap();
-        std::env::set_var("TMPDIR", &output_dir);
+        std::env::set_var("ARGS_OUT", output_dir.join("args.txt"));
         let process = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(adapter.start("https://example.com/video", Path::new("/tmp/out.bin")))
@@ -128,6 +128,7 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&executable, perms).unwrap();
         let adapter = DownloadCommandAdapter::new(&executable).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
         let process = adapter
             .start("https://example.com/video", Path::new("/tmp/out.bin"))
             .await

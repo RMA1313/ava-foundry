@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MediaAsset {
     pub id: Uuid,
     pub project_id: Uuid,
@@ -13,11 +13,18 @@ pub struct MediaAsset {
     pub original_filename: Option<String>,
     pub byte_size: i64,
     pub ingestion_status: String,
+    pub inspection_status: Option<String>,
+    pub container_format: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub codecs: Option<String>,
+    pub sample_rate_hz: Option<i32>,
+    pub channels: Option<i32>,
+    pub inspected_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MediaAssetUpsert {
     pub project_id: Uuid,
     pub source_id: Uuid,
@@ -26,6 +33,13 @@ pub struct MediaAssetUpsert {
     pub original_filename: Option<String>,
     pub byte_size: i64,
     pub ingestion_status: String,
+    pub inspection_status: Option<String>,
+    pub container_format: Option<String>,
+    pub duration_seconds: Option<f64>,
+    pub codecs: Option<String>,
+    pub sample_rate_hz: Option<i32>,
+    pub channels: Option<i32>,
+    pub inspected_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +65,11 @@ impl MediaAssetRepository {
             r#"
             insert into media_assets (
                 id, project_id, source_id, media_kind, staged_path,
-                original_filename, byte_size, ingestion_status, created_at, updated_at
+                original_filename, byte_size, ingestion_status,
+                inspection_status, container_format, duration_seconds, codecs,
+                sample_rate_hz, channels, inspected_at, created_at, updated_at
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now(), now())
             on conflict (source_id)
             do update set
                 project_id = excluded.project_id,
@@ -62,9 +78,18 @@ impl MediaAssetRepository {
                 original_filename = excluded.original_filename,
                 byte_size = excluded.byte_size,
                 ingestion_status = excluded.ingestion_status,
+                inspection_status = excluded.inspection_status,
+                container_format = excluded.container_format,
+                duration_seconds = excluded.duration_seconds,
+                codecs = excluded.codecs,
+                sample_rate_hz = excluded.sample_rate_hz,
+                channels = excluded.channels,
+                inspected_at = excluded.inspected_at,
                 updated_at = excluded.updated_at
             returning id, project_id, source_id, media_kind, staged_path,
                       original_filename, byte_size, ingestion_status,
+                      inspection_status, container_format, duration_seconds, codecs,
+                      sample_rate_hz, channels, inspected_at,
                       created_at, updated_at
             "#,
         )
@@ -76,6 +101,13 @@ impl MediaAssetRepository {
         .bind(request.original_filename.as_deref())
         .bind(request.byte_size)
         .bind(request.ingestion_status.as_str())
+        .bind(request.inspection_status.as_deref())
+        .bind(request.container_format.as_deref())
+        .bind(request.duration_seconds)
+        .bind(request.codecs.as_deref())
+        .bind(request.sample_rate_hz)
+        .bind(request.channels)
+        .bind(request.inspected_at)
         .fetch_one(executor)
         .await?;
         media_asset_from_row(&row)
@@ -86,6 +118,8 @@ impl MediaAssetRepository {
             r#"
             select id, project_id, source_id, media_kind, staged_path,
                    original_filename, byte_size, ingestion_status,
+                   inspection_status, container_format, duration_seconds, codecs,
+                   sample_rate_hz, channels, inspected_at,
                    created_at, updated_at
             from media_assets
             where source_id = $1
@@ -108,6 +142,13 @@ fn media_asset_from_row(row: &PgRow) -> Result<MediaAsset> {
         original_filename: row.try_get("original_filename")?,
         byte_size: row.try_get("byte_size")?,
         ingestion_status: row.try_get("ingestion_status")?,
+        inspection_status: row.try_get("inspection_status")?,
+        container_format: row.try_get("container_format")?,
+        duration_seconds: row.try_get("duration_seconds")?,
+        codecs: row.try_get("codecs")?,
+        sample_rate_hz: row.try_get("sample_rate_hz")?,
+        channels: row.try_get("channels")?,
+        inspected_at: row.try_get("inspected_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

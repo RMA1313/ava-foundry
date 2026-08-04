@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::{
     download::DownloadCommandAdapter,
+    ffprobe::{FfprobeAdapter, FfprobeOutput},
     ingestion,
     job::{Job, JobType},
     server::AppState,
@@ -351,6 +352,14 @@ pub fn media_ingestion_handler(
     }
 }
 
+pub fn media_inspection_handler(ffprobe_path: impl Into<PathBuf>) -> impl JobHandler {
+    let ffprobe_path = ffprobe_path.into();
+    move |job: Job, state: AppState| {
+        let ffprobe_path = ffprobe_path.clone();
+        async move { handle_media_inspection_job(&state, job, &ffprobe_path).await }
+    }
+}
+
 async fn handle_media_ingestion_job(
     state: &AppState,
     job: Job,
@@ -424,6 +433,161 @@ async fn handle_media_ingestion_job(
     }
 }
 
+async fn handle_media_inspection_job(
+    state: &AppState,
+    job: Job,
+    ffprobe_path: &Path,
+) -> Result<JobOutcome> {
+    let media_asset_id = job
+        .source_id
+        .ok_or_else(|| anyhow!("media inspection job requires a media asset id"))?;
+    let media_asset = state
+        .database
+        .media_assets()
+        .get_by_source(media_asset_id)
+        .await?
+        .ok_or_else(|| anyhow!("media asset not found"))?;
+    let adapter = match FfprobeAdapter::new(ffprobe_path) {
+        Ok(adapter) => adapter,
+        Err(err) => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+    };
+    let probed = match adapter
+        .probe(
+            Path::new(&media_asset.staged_path),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    {
+        Ok(output) => output,
+        Err(err) if err.to_string().contains("timed out") => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+        Err(err) if err.to_string().contains("parse ffprobe json") => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+        Err(err) if err.to_string().contains("ffprobe failed") => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+        Err(err) => {
+            return Ok(JobOutcome::Retry {
+                failure_reason: err.to_string(),
+                retry_after: Utc::now() + chrono::Duration::minutes(5),
+            })
+        }
+    };
+    persist_media_inspection(&state.database, &media_asset, &probed).await
+}
+
+async fn persist_media_inspection(
+    database: &crate::db::Database,
+    media_asset: &crate::media_asset::MediaAsset,
+    probed: &FfprobeOutput,
+) -> Result<JobOutcome> {
+    let container_format = probed
+        .format
+        .as_ref()
+        .and_then(|format| format.format_name.clone());
+    let duration_seconds = probed
+        .format
+        .as_ref()
+        .and_then(|format| format.duration.as_deref())
+        .and_then(|value| value.parse::<f64>().ok());
+    let audio_streams: Vec<_> = probed
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type.as_deref() == Some("audio"))
+        .collect();
+    let inspection_status = if audio_streams.is_empty() {
+        "no_audio_stream"
+    } else {
+        "inspectable"
+    };
+    if audio_streams.is_empty() {
+        let _ = database
+            .media_assets()
+            .upsert_ingested(
+                database.pool(),
+                crate::media_asset::MediaAssetUpsert {
+                    project_id: media_asset.project_id,
+                    source_id: media_asset.source_id,
+                    media_kind: media_asset.media_kind.clone(),
+                    staged_path: media_asset.staged_path.clone(),
+                    original_filename: media_asset.original_filename.clone(),
+                    byte_size: media_asset.byte_size,
+                    ingestion_status: media_asset.ingestion_status.clone(),
+                    inspection_status: Some(inspection_status.to_string()),
+                    container_format,
+                    duration_seconds,
+                    codecs: Some(
+                        probed
+                            .streams
+                            .iter()
+                            .filter_map(|stream| stream.codec_name.clone())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                    sample_rate_hz: None,
+                    channels: None,
+                    inspected_at: Some(Utc::now()),
+                },
+            )
+            .await?;
+        return Ok(JobOutcome::Failed {
+            failure_reason: "media has no audio stream".to_string(),
+        });
+    }
+    let audio = audio_streams[0];
+    let sample_rate_hz = audio
+        .sample_rate
+        .as_deref()
+        .and_then(|value| value.parse::<i32>().ok());
+    let channels = audio.channels;
+    let _ = database
+        .media_assets()
+        .upsert_ingested(
+            database.pool(),
+            crate::media_asset::MediaAssetUpsert {
+                project_id: media_asset.project_id,
+                source_id: media_asset.source_id,
+                media_kind: media_asset.media_kind.clone(),
+                staged_path: media_asset.staged_path.clone(),
+                original_filename: media_asset.original_filename.clone(),
+                byte_size: media_asset.byte_size,
+                ingestion_status: media_asset.ingestion_status.clone(),
+                inspection_status: Some(inspection_status.to_string()),
+                container_format,
+                duration_seconds,
+                codecs: Some(
+                    probed
+                        .streams
+                        .iter()
+                        .filter_map(|stream| stream.codec_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                sample_rate_hz,
+                channels,
+                inspected_at: Some(Utc::now()),
+            },
+        )
+        .await?;
+    Ok(JobOutcome::Completed)
+}
+
 pub async fn finalize_media_ingestion(
     database: &crate::db::Database,
     job_id: uuid::Uuid,
@@ -465,6 +629,13 @@ pub async fn finalize_media_ingestion(
                 original_filename: original_filename.map(str::to_string),
                 byte_size,
                 ingestion_status: "ready".to_string(),
+                inspection_status: None,
+                container_format: None,
+                duration_seconds: None,
+                codecs: None,
+                sample_rate_hz: None,
+                channels: None,
+                inspected_at: None,
             },
         )
         .await?;
@@ -531,12 +702,34 @@ mod tests {
     use chrono::Utc;
     use sqlx::PgPool;
     use std::{
-        env,
+        env, fs,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::atomic::AtomicU64,
     };
+    use tempfile::TempDir;
     use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    fn clear_env() {
+        for key in [
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "DATA_STUDIO_DATABASE_URL",
+            "DATA_STUDIO_WORKSPACE_DIR",
+            "DATA_STUDIO_DATA_DIR",
+            "DATA_STUDIO_TEMP_DIR",
+            "DATA_STUDIO_AUDIO_DIR",
+            "DATA_STUDIO_AUDIO_TEMP_DIR",
+            "DATA_STUDIO_STAGING_PAUSE_FREE_BYTES",
+            "DATA_STUDIO_STAGING_RESUME_FREE_BYTES",
+            "DATA_STUDIO_HOST",
+            "DATA_STUDIO_PORT",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
 
     #[derive(Clone, Default)]
     struct FakeFilesystemMetrics {
@@ -737,6 +930,196 @@ mod tests {
             .await
             .expect("dispatch should succeed");
         assert_eq!(*calls.lock().await, 1);
+    }
+
+    fn fake_ffprobe(dir: &TempDir, json: &str) -> PathBuf {
+        let path = dir.path().join("fake-ffprobe");
+        fs::write(&path, format!("#!/bin/sh\ncat <<'JSON'\n{}\nJSON\n", json))
+            .expect("script should write");
+        let mut perms = fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("permissions");
+        path
+    }
+
+    async fn seed_media_asset(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+        let project_id = seed_project(pool).await;
+        let source_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, now(), now())
+            "#,
+        )
+        .bind(source_id)
+        .bind(project_id)
+        .bind("public_url")
+        .bind(Some("https://example.com/video"))
+        .bind("url:https://example.com/video")
+        .bind(Option::<String>::None)
+        .bind("completed")
+        .execute(pool)
+        .await
+        .expect("source should insert");
+        let media_asset_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into media_assets (
+                id, project_id, source_id, media_kind, staged_path,
+                original_filename, byte_size, ingestion_status,
+                inspection_status, container_format, duration_seconds, codecs,
+                sample_rate_hz, channels, inspected_at, created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, $6, $7, $8, null, null, null, null, null, null, null, now(), now())
+            "#,
+        )
+        .bind(media_asset_id)
+        .bind(project_id)
+        .bind(source_id)
+        .bind("video")
+        .bind("/tmp/staged/source.bin")
+        .bind(Some("source.mp4"))
+        .bind(12_i64)
+        .bind("ready")
+        .execute(pool)
+        .await
+        .expect("media asset should insert");
+        (project_id, source_id, media_asset_id)
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_persists_inspected_media_metadata() {
+        clear_env();
+        let pool = test_pool().await;
+        let (project_id, source_id, _) = seed_media_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = TempDir::new().expect("temp dir");
+        fs::write(temp_dir.path().join("sample.bin"), b"sample").expect("sample");
+        let executable = fake_ffprobe(
+            &temp_dir,
+            r#"{"format":{"format_name":"matroska,webm","duration":"12.5"},"streams":[{"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2}]}"#,
+        );
+        let _job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(source_id),
+                JobType::MediaInspection,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::MediaInspection,
+            media_inspection_handler(executable),
+        );
+        let handlers = runtime.handlers.clone();
+        runtime
+            .execute_job(
+                AppState {
+                    database: database.clone(),
+                    staging_dir: temp_dir.path().to_path_buf(),
+                    staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                        1,
+                        2,
+                        DefaultFilesystemMetrics,
+                    )),
+                },
+                handlers,
+                job,
+            )
+            .await
+            .expect("inspection should succeed");
+        let asset = database
+            .media_assets()
+            .get_by_source(source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.inspection_status.as_deref(), Some("inspectable"));
+        assert_eq!(asset.container_format.as_deref(), Some("matroska,webm"));
+        assert_eq!(asset.sample_rate_hz, Some(48000));
+        assert_eq!(asset.channels, Some(2));
+    }
+
+    #[tokio::test]
+    async fn worker_runtime_marks_no_audio_as_terminal_failure_and_is_idempotent() {
+        clear_env();
+        let pool = test_pool().await;
+        let (project_id, source_id, _) = seed_media_asset(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = TempDir::new().expect("temp dir");
+        let executable = fake_ffprobe(
+            &temp_dir,
+            r#"{"format":{"format_name":"matroska,webm","duration":"12.5"},"streams":[{"codec_type":"video","codec_name":"h264"}]}"#,
+        );
+        let _job = database
+            .jobs()
+            .create(
+                project_id,
+                Some(source_id),
+                JobType::MediaInspection,
+                0,
+                Utc::now(),
+            )
+            .await
+            .expect("job should be created");
+        let job = database
+            .jobs()
+            .claim_next("worker-test", Utc::now() + chrono::Duration::minutes(5))
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = WorkerRuntime::new("worker-test".to_string()).with_handler(
+            JobType::MediaInspection,
+            media_inspection_handler(executable.clone()),
+        );
+        let handlers = runtime.handlers.clone();
+        let state = AppState {
+            database: database.clone(),
+            staging_dir: temp_dir.path().to_path_buf(),
+            staging_capacity_guard: Arc::new(StagingCapacityGuard::new(
+                1,
+                2,
+                DefaultFilesystemMetrics,
+            )),
+        };
+        runtime
+            .clone()
+            .execute_job(state.clone(), handlers, job.clone())
+            .await
+            .expect("inspection should run");
+        let first = database
+            .media_assets()
+            .get_by_source(source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.inspection_status.as_deref(), Some("no_audio_stream"));
+        let runtime = WorkerRuntime::new("worker-test-2".to_string()).with_handler(
+            JobType::MediaInspection,
+            media_inspection_handler(executable),
+        );
+        let handlers = runtime.handlers.clone();
+        runtime
+            .execute_job(state, handlers, job)
+            .await
+            .expect("reinspection should run");
+        let second = database
+            .media_assets()
+            .get_by_source(source_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.inspection_status.as_deref(), Some("no_audio_stream"));
     }
 
     #[test]

@@ -622,6 +622,7 @@ fn job_type_name(job_type: JobType) -> &'static str {
         JobType::IntervalMining => "interval_mining",
         JobType::ManualReview => "manual_review",
         JobType::DatasetExport => "dataset_export",
+        JobType::MediaInspection => "media_inspection",
     }
 }
 

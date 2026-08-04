@@ -88,6 +88,13 @@ async fn repository_round_trip_and_idempotency_work() {
                 original_filename: Some("source.mp4".to_string()),
                 byte_size: 12,
                 ingestion_status: "ready".to_string(),
+                inspection_status: None,
+                container_format: None,
+                duration_seconds: None,
+                codecs: None,
+                sample_rate_hz: None,
+                channels: None,
+                inspected_at: None,
             },
         )
         .await
@@ -104,6 +111,13 @@ async fn repository_round_trip_and_idempotency_work() {
                 original_filename: Some("source.mp4".to_string()),
                 byte_size: 12,
                 ingestion_status: "ready".to_string(),
+                inspection_status: None,
+                container_format: None,
+                duration_seconds: None,
+                codecs: None,
+                sample_rate_hz: None,
+                channels: None,
+                inspected_at: None,
             },
         )
         .await
@@ -132,9 +146,11 @@ async fn migration_creates_media_assets_table_with_source_link_and_unique_constr
         r#"
         insert into media_assets (
             id, project_id, source_id, media_kind, staged_path,
-            original_filename, byte_size, ingestion_status, created_at, updated_at
+            original_filename, byte_size, ingestion_status,
+            inspection_status, container_format, duration_seconds, codecs,
+            sample_rate_hz, channels, inspected_at, created_at, updated_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        values ($1, $2, $3, $4, $5, $6, $7, $8, null, null, null, null, null, null, null, now(), now())
         "#,
     )
     .bind(Uuid::new_v4())
@@ -153,9 +169,11 @@ async fn migration_creates_media_assets_table_with_source_link_and_unique_constr
         r#"
         insert into media_assets (
             id, project_id, source_id, media_kind, staged_path,
-            original_filename, byte_size, ingestion_status, created_at, updated_at
+            original_filename, byte_size, ingestion_status,
+            inspection_status, container_format, duration_seconds, codecs,
+            sample_rate_hz, channels, inspected_at, created_at, updated_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        values ($1, $2, $3, $4, $5, $6, $7, $8, null, null, null, null, null, null, null, now(), now())
         "#,
     )
     .bind(Uuid::new_v4())
@@ -174,9 +192,11 @@ async fn migration_creates_media_assets_table_with_source_link_and_unique_constr
         r#"
         insert into media_assets (
             id, project_id, source_id, media_kind, staged_path,
-            original_filename, byte_size, ingestion_status, created_at, updated_at
+            original_filename, byte_size, ingestion_status,
+            inspection_status, container_format, duration_seconds, codecs,
+            sample_rate_hz, channels, inspected_at, created_at, updated_at
         )
-        values ($1, $2, $3, $4, $5, $6, $7, $8, now(), now())
+        values ($1, $2, $3, $4, $5, $6, $7, $8, null, null, null, null, null, null, null, now(), now())
         "#,
     )
     .bind(Uuid::new_v4())

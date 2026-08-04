@@ -23,6 +23,13 @@ create table if not exists media_assets (
     original_filename text,
     byte_size bigint not null,
     ingestion_status text not null,
+    inspection_status text,
+    container_format text,
+    duration_seconds double precision,
+    codecs text,
+    sample_rate_hz integer,
+    channels integer,
+    inspected_at timestamptz,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
