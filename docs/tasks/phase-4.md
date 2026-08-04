@@ -2,7 +2,7 @@
 
 ## Goal
 
-Provide a complete user workspace for managing projects, sources, jobs, media, audio assets, duplicate groups, and pipeline execution.
+Provide a complete user workspace for managing projects, sources, jobs, media, audio assets, duplicate groups, and pipeline execution. i need fully RTL and persian Frontend and very biutiful and highly mature UI/UX.
 
 ## Phase Constraints
 
