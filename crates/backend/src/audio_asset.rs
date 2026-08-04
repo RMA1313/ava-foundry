@@ -43,6 +43,19 @@ pub struct AudioAssetUpsert {
     pub storage_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioAssetListFilter {
+    pub project_id: Uuid,
+    pub processing_status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioAssetPage {
+    pub items: Vec<AudioAsset>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioAssetRepository {
     pool: PgPool,
@@ -126,6 +139,26 @@ impl AudioAssetRepository {
     }
 
     pub async fn list(&self, project_id: Uuid) -> Result<Vec<AudioAsset>> {
+        self.list_paginated(
+            AudioAssetListFilter {
+                project_id,
+                processing_status: None,
+            },
+            100,
+            0,
+        )
+        .await
+        .map(|page| page.items)
+    }
+
+    pub async fn list_paginated(
+        &self,
+        filter: AudioAssetListFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<AudioAssetPage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
         let rows = sqlx::query(
             r#"
             select id, media_asset_id, project_id, processing_status, duration_seconds,
@@ -134,13 +167,26 @@ impl AudioAssetRepository {
                    created_at, updated_at
             from audio_assets
             where project_id = $1
+              and ($2::text is null or processing_status = $2)
             order by created_at asc, id asc
+            limit $3 offset $4
             "#,
         )
-        .bind(project_id)
+        .bind(filter.project_id)
+        .bind(filter.processing_status.as_deref())
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(audio_asset_from_row).collect()
+        let items = rows
+            .iter()
+            .map(audio_asset_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AudioAssetPage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+        })
     }
 
     pub async fn get_by_media_asset(&self, media_asset_id: Uuid) -> Result<Option<AudioAsset>> {
@@ -155,6 +201,25 @@ impl AudioAssetRepository {
             "#,
         )
         .bind(media_asset_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(audio_asset_from_row).transpose()
+    }
+
+    pub async fn get_in_project(&self, project_id: Uuid, id: Uuid) -> Result<Option<AudioAsset>> {
+        let row = sqlx::query(
+            r#"
+            select id, media_asset_id, project_id, processing_status, duration_seconds,
+                   normalization_profile, validation_status, validation_error, validated_at,
+                   audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
+                   created_at, updated_at
+            from audio_assets
+            where project_id = $1
+              and id = $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref().map(audio_asset_from_row).transpose()

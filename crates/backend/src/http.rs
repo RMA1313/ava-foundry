@@ -5,8 +5,10 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
+    audio_asset::AudioAssetListFilter,
     ingestion,
     job::{JobListFilter, JobStatus, JobType},
     server::AppState,
@@ -70,6 +72,13 @@ struct JobListQuery {
     offset: Option<u32>,
     job_type: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AudioAssetListQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+    processing_status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +161,35 @@ struct JobsResponse {
     offset: u32,
 }
 
+#[derive(Serialize)]
+struct AudioAssetResponse {
+    id: String,
+    project_id: String,
+    media_asset_id: String,
+    source_id: Option<String>,
+    processing_status: String,
+    normalization_profile: Option<String>,
+    validation_status: Option<String>,
+    validation_error: Option<String>,
+    validated_at: Option<String>,
+    duration_seconds: f64,
+    audio_format: String,
+    codec: String,
+    sample_rate_hz: i32,
+    channels: i32,
+    byte_size: i64,
+    storage_path: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct AudioAssetsResponse {
+    items: Vec<AudioAssetResponse>,
+    limit: u32,
+    offset: u32,
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -185,6 +223,11 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id", get(get_project).put(update_project))
         .route("/projects/:id/sources", get(list_sources))
         .route("/projects/:id/jobs", get(list_jobs))
+        .route("/projects/:id/audio-assets", get(list_audio_assets))
+        .route(
+            "/projects/:id/audio-assets/:audio_asset_id",
+            get(get_audio_asset),
+        )
         .route("/projects/:project_id/jobs/:job_id/retry", post(retry_job))
         .route(
             "/projects/:id/sources/local-file",
@@ -409,6 +452,60 @@ async fn list_jobs(
     }))
 }
 
+async fn list_audio_assets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<AudioAssetListQuery>,
+) -> Result<Json<AudioAssetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let page = state
+        .database
+        .audio_assets()
+        .list_paginated(
+            AudioAssetListFilter {
+                project_id,
+                processing_status: query.processing_status.clone(),
+            },
+            query.limit.unwrap_or(50) as i64,
+            query.offset.unwrap_or(0) as i64,
+        )
+        .await
+        .map_err(database_error)?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for audio_asset in page.items {
+        let source_id = resolve_audio_asset_source_id(&state, audio_asset.media_asset_id).await?;
+        items.push(audio_asset_response(audio_asset, source_id));
+    }
+    Ok(Json(AudioAssetsResponse {
+        items,
+        limit: page.limit,
+        offset: page.offset,
+    }))
+}
+
+async fn get_audio_asset(
+    State(state): State<AppState>,
+    Path((project_id, audio_asset_id)): Path<(String, String)>,
+) -> Result<Json<AudioAssetResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let audio_asset_id = parse_uuid(&audio_asset_id)?;
+    let audio_asset = state
+        .database
+        .audio_assets()
+        .get_in_project(project_id, audio_asset_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "audio_asset_not_found",
+                "audio asset not found",
+            )
+        })?;
+    let source_id = resolve_audio_asset_source_id(&state, audio_asset.media_asset_id).await?;
+    Ok(Json(audio_asset_response(audio_asset, source_id)))
+}
+
 async fn retry_job(
     State(state): State<AppState>,
     Path((project_id, job_id)): Path<(String, String)>,
@@ -596,6 +693,45 @@ fn job_response(job: crate::job::Job) -> JobResponse {
         created_at: job.created_at.to_rfc3339(),
         updated_at: job.updated_at.to_rfc3339(),
     }
+}
+
+fn audio_asset_response(
+    audio_asset: crate::audio_asset::AudioAsset,
+    source_id: Option<Uuid>,
+) -> AudioAssetResponse {
+    AudioAssetResponse {
+        id: audio_asset.id.to_string(),
+        project_id: audio_asset.project_id.to_string(),
+        media_asset_id: audio_asset.media_asset_id.to_string(),
+        source_id: source_id.map(|value| value.to_string()),
+        processing_status: audio_asset.processing_status,
+        normalization_profile: audio_asset.normalization_profile,
+        validation_status: audio_asset.validation_status,
+        validation_error: audio_asset.validation_error,
+        validated_at: audio_asset.validated_at.map(|value| value.to_rfc3339()),
+        duration_seconds: audio_asset.duration_seconds,
+        audio_format: audio_asset.audio_format,
+        codec: audio_asset.codec,
+        sample_rate_hz: audio_asset.sample_rate_hz,
+        channels: audio_asset.channels,
+        byte_size: audio_asset.byte_size,
+        storage_path: audio_asset.storage_path,
+        created_at: audio_asset.created_at.to_rfc3339(),
+        updated_at: audio_asset.updated_at.to_rfc3339(),
+    }
+}
+
+async fn resolve_audio_asset_source_id(
+    state: &AppState,
+    media_asset_id: Uuid,
+) -> Result<Option<Uuid>, (StatusCode, Json<ErrorResponse>)> {
+    let media_asset = state
+        .database
+        .media_assets()
+        .get(media_asset_id)
+        .await
+        .map_err(database_error)?;
+    Ok(media_asset.map(|asset| asset.source_id))
 }
 
 fn source_type_name(source_type: SourceType) -> &'static str {

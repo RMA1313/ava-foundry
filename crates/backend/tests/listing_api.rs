@@ -235,6 +235,201 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
 }
 
 #[tokio::test]
+async fn audio_assets_can_be_listed_and_read_with_project_isolation() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool, "Research").await;
+    let other_project_id = seed_project(&pool, "Other").await;
+    let database = Database::from_pool(pool.clone());
+
+    let media_asset_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, null, $6, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(project_id)
+    .bind("public_url")
+    .bind(Some("https://youtu.be/aaaa1111"))
+    .bind("url:youtube:aaaa1111")
+    .bind("staged")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "
+        insert into media_assets (
+            id, project_id, source_id, media_kind, staged_path,
+            original_filename, byte_size, ingestion_status, inspection_status,
+            extraction_status, extraction_progress, extraction_tmp_path, extracted_at,
+            container_format, duration_seconds, codecs, sample_rate_hz, channels,
+            inspected_at, created_at, updated_at
+        )
+        values (
+            '{media_asset_id}',
+            '{project_id}',
+            (select id from sources where project_id = '{project_id}' limit 1),
+            'video',
+            '/tmp/staged/source.bin',
+            'source.mp4',
+            12,
+            'ready',
+            'inspectable',
+            'extracted',
+            'running',
+            null,
+            null,
+            'mp4',
+            12.5,
+            'aac',
+            16000,
+            1,
+            null,
+            now(),
+            now()
+        )
+        "
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        insert into audio_assets (
+            id, media_asset_id, project_id, processing_status, duration_seconds,
+            normalization_profile, validation_status, validation_error, validated_at,
+            audio_format, codec, sample_rate_hz, channels, byte_size, storage_path,
+            created_at, updated_at
+        )
+        values ($1, $2, $3, $4, $5, $6, $7, null, now(), $8, $9, $10, $11, $12, $13, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(media_asset_id)
+    .bind(project_id)
+    .bind("validated")
+    .bind(12.5_f64)
+    .bind(Some("flac:flac:16000:1"))
+    .bind(Some("validated"))
+    .bind("flac")
+    .bind("flac")
+    .bind(16000_i32)
+    .bind(1_i32)
+    .bind(1024_i64)
+    .bind("/data/audio/audio-assets/asset.flac")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        insert into sources (id, project_id, source_type, original_url, normalized_identity, import_metadata, ingestion_status, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, null, $6, now(), now())
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(other_project_id)
+    .bind("public_url")
+    .bind(Some("https://youtu.be/zzzz9999"))
+    .bind("url:youtube:zzzz9999")
+    .bind("staged")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = backend::http::router(AppState {
+        database,
+        staging_dir: PathBuf::from("/tmp"),
+        audio_storage: AudioStorageConfig::new(
+            PathBuf::from("/tmp/audio"),
+            PathBuf::from("/tmp/audio-tmp"),
+        ),
+        audio_normalization_profile: AudioNormalizationProfile::default_flac_16khz_mono(),
+        staging_capacity_guard: Arc::new(backend::worker::StagingCapacityGuard::new(
+            1,
+            2,
+            backend::worker::DefaultFilesystemMetrics,
+        )),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/projects/{project_id}/audio-assets?limit=1&offset=0&processing_status=validated"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let assets: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(assets["items"].as_array().unwrap().len(), 1);
+    assert_eq!(assets["items"][0]["project_id"], project_id.to_string());
+    assert_eq!(
+        assets["items"][0]["media_asset_id"],
+        media_asset_id.to_string()
+    );
+    assert_eq!(assets["items"][0]["source_id"].as_str().unwrap().len(), 36);
+    assert_eq!(assets["items"][0]["processing_status"], "validated");
+
+    let asset_id = assets["items"][0]["id"].as_str().unwrap().to_string();
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/projects/{project_id}/audio-assets/{asset_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(detail.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let asset: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(asset["storage_path"], "/data/audio/audio-assets/asset.flac");
+    assert_eq!(asset["validation_status"], "validated");
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/projects/{other_project_id}/audio-assets/{asset_id}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let paged = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/projects/{project_id}/audio-assets?limit=1&offset=1"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paged.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(paged.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
     support::clear_env();
     let pool = test_pool().await;

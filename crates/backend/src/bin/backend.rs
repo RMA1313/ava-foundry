@@ -7,7 +7,9 @@ use backend::{
     db::Database,
     server::{self, AppState},
     storage::AudioStorageConfig,
-    worker::{DefaultFilesystemMetrics, StagingCapacityGuard, WorkerRuntime},
+    worker::{
+        DefaultFilesystemMetrics, ExtractionBackpressureGuard, StagingCapacityGuard, WorkerRuntime,
+    },
 };
 use tracing::info;
 
@@ -38,6 +40,14 @@ async fn main() -> Result<()> {
         staging_capacity_guard,
     };
     WorkerRuntime::new("startup-recovery".to_string())
+        .with_concurrency_limit(config.audio_extraction_concurrency_limit)
+        .with_extraction_backpressure_guard(ExtractionBackpressureGuard::new(
+            config.audio_extraction_pause_free_bytes,
+            config.audio_extraction_resume_free_bytes,
+            config.audio_extraction_queue_pause_limit,
+            config.audio_extraction_queue_resume_limit,
+            DefaultFilesystemMetrics,
+        ))
         .recover_abandoned_temp_outputs(&state)
         .await?;
     server::serve(addr, state).await

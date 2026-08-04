@@ -29,6 +29,11 @@ pub struct AppConfig {
     pub temp_dir: PathBuf,
     pub audio_dir: PathBuf,
     pub audio_temp_dir: PathBuf,
+    pub audio_extraction_concurrency_limit: usize,
+    pub audio_extraction_pause_free_bytes: u64,
+    pub audio_extraction_resume_free_bytes: u64,
+    pub audio_extraction_queue_pause_limit: i64,
+    pub audio_extraction_queue_resume_limit: i64,
     pub staging_pause_free_bytes: u64,
     pub staging_resume_free_bytes: u64,
     pub audio_normalization_profile: AudioNormalizationProfile,
@@ -59,6 +64,32 @@ impl AppConfig {
             std::env::var("DATA_STUDIO_AUDIO_TEMP_DIR")
                 .unwrap_or_else(|_| temp_dir.join("audio").to_string_lossy().into_owned()),
         );
+        let audio_extraction_concurrency_limit =
+            std::env::var("DATA_STUDIO_AUDIO_EXTRACTION_CONCURRENCY_LIMIT")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse::<usize>()
+                .context("DATA_STUDIO_AUDIO_EXTRACTION_CONCURRENCY_LIMIT must be a valid usize")?
+                .max(1);
+        let audio_extraction_pause_free_bytes =
+            std::env::var("DATA_STUDIO_AUDIO_EXTRACTION_PAUSE_FREE_BYTES")
+                .unwrap_or_else(|_| "1073741824".to_string())
+                .parse::<u64>()
+                .context("DATA_STUDIO_AUDIO_EXTRACTION_PAUSE_FREE_BYTES must be a valid u64")?;
+        let audio_extraction_resume_free_bytes =
+            std::env::var("DATA_STUDIO_AUDIO_EXTRACTION_RESUME_FREE_BYTES")
+                .unwrap_or_else(|_| "2147483648".to_string())
+                .parse::<u64>()
+                .context("DATA_STUDIO_AUDIO_EXTRACTION_RESUME_FREE_BYTES must be a valid u64")?;
+        let audio_extraction_queue_pause_limit =
+            std::env::var("DATA_STUDIO_AUDIO_EXTRACTION_QUEUE_PAUSE_LIMIT")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse::<i64>()
+                .context("DATA_STUDIO_AUDIO_EXTRACTION_QUEUE_PAUSE_LIMIT must be a valid i64")?;
+        let audio_extraction_queue_resume_limit =
+            std::env::var("DATA_STUDIO_AUDIO_EXTRACTION_QUEUE_RESUME_LIMIT")
+                .unwrap_or_else(|_| "50".to_string())
+                .parse::<i64>()
+                .context("DATA_STUDIO_AUDIO_EXTRACTION_QUEUE_RESUME_LIMIT must be a valid i64")?;
         let staging_pause_free_bytes = std::env::var("DATA_STUDIO_STAGING_PAUSE_FREE_BYTES")
             .unwrap_or_else(|_| "1073741824".to_string())
             .parse::<u64>()
@@ -94,6 +125,11 @@ impl AppConfig {
             temp_dir,
             audio_dir,
             audio_temp_dir,
+            audio_extraction_concurrency_limit,
+            audio_extraction_pause_free_bytes,
+            audio_extraction_resume_free_bytes,
+            audio_extraction_queue_pause_limit,
+            audio_extraction_queue_resume_limit,
             staging_pause_free_bytes,
             staging_resume_free_bytes,
             audio_normalization_profile,

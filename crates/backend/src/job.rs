@@ -121,6 +121,12 @@ pub struct JobPage {
     pub offset: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobQueueCount {
+    pub queued: i64,
+    pub running: i64,
+}
+
 impl JobRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -291,6 +297,23 @@ impl JobRepository {
         .await?;
         tx.commit().await?;
         row.as_ref().map(job_from_row).transpose()
+    }
+
+    pub async fn queue_count(&self, job_type: JobType, project_id: Option<Uuid>) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            select count(*)::bigint as count
+            from jobs
+            where job_type = $1
+              and status = 'queued'
+              and ($2::uuid is null or project_id = $2)
+            "#,
+        )
+        .bind(job_type.as_str())
+        .bind(project_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("count")?)
     }
 
     pub async fn complete(&self, id: Uuid) -> Result<Option<Job>> {

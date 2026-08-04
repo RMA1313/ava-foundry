@@ -117,6 +117,98 @@ pub struct StagingCapacityState {
     pub resume_free_bytes: u64,
 }
 
+#[derive(Clone)]
+pub struct ExtractionBackpressureGuard {
+    temp_pause_free_bytes: u64,
+    temp_resume_free_bytes: u64,
+    queue_pause_limit: i64,
+    queue_resume_limit: i64,
+    metrics: Arc<dyn FilesystemMetrics>,
+    paused: Arc<AtomicBool>,
+}
+
+impl ExtractionBackpressureGuard {
+    pub fn new(
+        temp_pause_free_bytes: u64,
+        temp_resume_free_bytes: u64,
+        queue_pause_limit: i64,
+        queue_resume_limit: i64,
+        metrics: impl FilesystemMetrics,
+    ) -> Self {
+        Self {
+            temp_pause_free_bytes,
+            temp_resume_free_bytes,
+            queue_pause_limit,
+            queue_resume_limit,
+            metrics: Arc::new(metrics),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn check<F, Fut>(
+        &self,
+        temp_root: &Path,
+        queued_jobs: F,
+    ) -> ExtractionBackpressureState
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<i64>>,
+    {
+        let currently_paused = self.paused.load(Ordering::SeqCst);
+        let resource_check = async move {
+            let free_bytes = self.metrics.free_bytes(temp_root)?;
+            let total_bytes = self.metrics.total_bytes(temp_root)?;
+            let queued = queued_jobs().await?;
+            let next_paused = if currently_paused {
+                free_bytes < self.temp_resume_free_bytes || queued > self.queue_resume_limit
+            } else {
+                free_bytes < self.temp_pause_free_bytes || queued >= self.queue_pause_limit
+            };
+            Ok::<_, anyhow::Error>(ExtractionBackpressureState {
+                paused: next_paused,
+                free_bytes,
+                total_bytes,
+                queued_jobs: queued,
+                temp_pause_free_bytes: self.temp_pause_free_bytes,
+                temp_resume_free_bytes: self.temp_resume_free_bytes,
+                queue_pause_limit: self.queue_pause_limit,
+                queue_resume_limit: self.queue_resume_limit,
+            })
+        };
+        match resource_check.await {
+            Ok(state) => {
+                self.paused.store(state.paused, Ordering::SeqCst);
+                state
+            }
+            Err(_) => {
+                self.paused.store(true, Ordering::SeqCst);
+                ExtractionBackpressureState {
+                    paused: true,
+                    free_bytes: 0,
+                    total_bytes: 0,
+                    queued_jobs: 0,
+                    temp_pause_free_bytes: self.temp_pause_free_bytes,
+                    temp_resume_free_bytes: self.temp_resume_free_bytes,
+                    queue_pause_limit: self.queue_pause_limit,
+                    queue_resume_limit: self.queue_resume_limit,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionBackpressureState {
+    pub paused: bool,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+    pub queued_jobs: i64,
+    pub temp_pause_free_bytes: u64,
+    pub temp_resume_free_bytes: u64,
+    pub queue_pause_limit: i64,
+    pub queue_resume_limit: i64,
+}
+
 #[cfg(unix)]
 fn filesystem_bytes(path: &Path) -> Result<(u64, u64)> {
     use std::process::Command;
@@ -164,6 +256,7 @@ pub struct WorkerRuntime {
     concurrency_limit: usize,
     staging_dir: Option<PathBuf>,
     staging_capacity_guard: Option<StagingCapacityGuard>,
+    extraction_backpressure_guard: Option<ExtractionBackpressureGuard>,
     handlers: Arc<HashMap<JobType, Arc<dyn JobHandler>>>,
 }
 
@@ -177,6 +270,7 @@ impl WorkerRuntime {
             concurrency_limit: 1,
             staging_dir: None,
             staging_capacity_guard: None,
+            extraction_backpressure_guard: None,
             handlers: Arc::new(HashMap::new()),
         }
     }
@@ -215,6 +309,14 @@ impl WorkerRuntime {
     ) -> Self {
         self.staging_dir = Some(staging_dir.into());
         self.staging_capacity_guard = Some(guard);
+        self
+    }
+
+    pub fn with_extraction_backpressure_guard(
+        mut self,
+        guard: ExtractionBackpressureGuard,
+    ) -> Self {
+        self.extraction_backpressure_guard = Some(guard);
         self
     }
 
@@ -295,6 +397,34 @@ impl WorkerRuntime {
                         pause_free_bytes = capacity.pause_free_bytes,
                         resume_free_bytes = capacity.resume_free_bytes,
                         "staging capacity guard paused new claims"
+                    );
+                    break;
+                }
+            }
+            if let Some(guard) = &self.extraction_backpressure_guard {
+                let temp_root = &state.audio_storage.temporary_root;
+                let database = state.database.clone();
+                let capacity = guard
+                    .check(temp_root, move || {
+                        let database = database.clone();
+                        async move {
+                            database
+                                .jobs()
+                                .queue_count(JobType::AudioExtraction, None)
+                                .await
+                        }
+                    })
+                    .await;
+                if capacity.paused {
+                    info!(
+                        free_bytes = capacity.free_bytes,
+                        total_bytes = capacity.total_bytes,
+                        queued_jobs = capacity.queued_jobs,
+                        temp_pause_free_bytes = capacity.temp_pause_free_bytes,
+                        temp_resume_free_bytes = capacity.temp_resume_free_bytes,
+                        queue_pause_limit = capacity.queue_pause_limit,
+                        queue_resume_limit = capacity.queue_resume_limit,
+                        "extraction backpressure guard paused new claims"
                     );
                     break;
                 }
@@ -1851,6 +1981,34 @@ mod tests {
         metrics.set_free_bytes(9);
         let third = guard.check(Path::new("/tmp")).expect("capacity check");
         assert!(!third.paused);
+    }
+
+    #[test]
+    fn extraction_backpressure_guard_follows_hysteresis_and_fails_safe() {
+        let metrics = FakeFilesystemMetrics::new(5, 10);
+        let guard = ExtractionBackpressureGuard::new(6, 8, 10, 5, metrics.clone());
+
+        let first = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(guard.check(Path::new("/tmp"), || async { Ok(12) }));
+        assert!(first.paused);
+
+        metrics.set_free_bytes(7);
+        let second = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(guard.check(Path::new("/tmp"), || async { Ok(12) }));
+        assert!(second.paused);
+
+        metrics.set_free_bytes(9);
+        let third = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(guard.check(Path::new("/tmp"), || async { Ok(4) }));
+        assert!(!third.paused);
+
+        let failed = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(guard.check(Path::new("/tmp"), || async { Err(anyhow!("boom")) }));
+        assert!(failed.paused);
     }
 }
 
