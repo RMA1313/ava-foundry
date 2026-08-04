@@ -18,3 +18,4 @@ tmp/
 .env
 .env.*
 !.env.example
+.pnpm-store/
