@@ -8,7 +8,6 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 use serde_json::Value;
 use walkdir::WalkDir;
 use zip::read::ZipArchive;
@@ -330,16 +329,7 @@ pub async fn import_dataset_manifest(
             let iter = reader.get_row_iter(None)?;
             for row in iter {
                 let row = row?;
-                let mut record = serde_json::Map::new();
-                for index in 0..row.len() {
-                    let key = format!("col_{index}");
-                    let value = row
-                        .get_string(index)
-                        .map(|value| Value::String(value.to_string()))
-                        .unwrap_or(Value::Null);
-                    record.insert(key, value);
-                }
-                let record = Value::Object(record);
+                let record = row.to_json_value();
                 if let Some(result) = register_json_record(
                     database,
                     project_id,
@@ -356,6 +346,28 @@ pub async fn import_dataset_manifest(
         _ => return Err(anyhow!("unsupported manifest format")),
     }
     Ok(results)
+}
+
+pub async fn import_archive_dataset(
+    database: &Database,
+    project_id: uuid::Uuid,
+    archive_path: &Path,
+    selected_manifest: Option<&Path>,
+    audio_path_field: &str,
+    workspace_dir: &Path,
+) -> Result<Vec<DatasetItemResult>> {
+    let extract_dir = extract_archive(archive_path, workspace_dir).await?;
+    let result = async {
+        let manifest_path = match selected_manifest {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => extract_dir.join(path),
+            None => find_supported_manifest(&extract_dir)?,
+        };
+        import_dataset_manifest(database, project_id, &manifest_path, audio_path_field).await
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    result
 }
 
 async fn register_manifest_record(
@@ -513,11 +525,21 @@ fn extract_tar<R: std::io::Read>(archive: &mut tar::Archive<R>, output_dir: &Pat
 }
 
 fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
-    let candidate = base.join(relative);
-    let normalized = candidate.components().fold(PathBuf::new(), |mut acc, c| {
-        acc.push(c);
-        acc
-    });
+    let mut normalized = PathBuf::from(base);
+    for component in Path::new(relative).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() || !normalized.starts_with(base) {
+                    return Err(anyhow!("archive entry attempted path traversal"));
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(anyhow!("archive entry attempted path traversal"));
+            }
+        }
+    }
     if !normalized.starts_with(base) {
         return Err(anyhow!("archive entry attempted path traversal"));
     }
@@ -572,4 +594,404 @@ fn staging_path_from_metadata(metadata: &str) -> Result<PathBuf> {
         .and_then(|value| value.as_str())
         .ok_or_else(|| anyhow!("missing staged_path"))?;
     Ok(PathBuf::from(path))
+}
+
+fn find_supported_manifest(root: &Path) -> Result<PathBuf> {
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        match path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("csv") | Some("jsonl") | Some("json") | Some("parquet") => {
+                return Ok(path.to_path_buf())
+            }
+            _ => {}
+        }
+    }
+    Err(anyhow!("no supported manifest found"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::migrations;
+    use flate2::{write::GzEncoder, Compression};
+    use parquet::{
+        data_type::{ByteArray, ByteArrayType},
+        file::{properties::WriterProperties, writer::SerializedFileWriter},
+        schema::parser::parse_message_type,
+    };
+    use std::{env, fs, fs::File, io::Write, path::PathBuf, sync::Arc};
+    use uuid::Uuid;
+    use zip::read::ZipArchive;
+
+    fn clear_env() {
+        for key in [
+            "DATA_STUDIO_DATABASE_URL",
+            "DATA_STUDIO_WORKSPACE_DIR",
+            "DATA_STUDIO_DATA_DIR",
+            "DATA_STUDIO_TEMP_DIR",
+            "DATA_STUDIO_HOST",
+            "DATA_STUDIO_PORT",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ingestion_manifest_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    async fn test_pool() -> sqlx::PgPool {
+        let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
+            .or_else(|_| env::var("DATA_STUDIO_DATABASE_URL"))
+            .unwrap_or_else(|_| {
+                "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+            });
+        let schema_name = format!("ingestion_manifest_test_{}", Uuid::new_v4().simple());
+        let admin_pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("failed to connect to test database");
+        sqlx::query(&format!("create schema {}", schema_name))
+            .execute(&admin_pool)
+            .await
+            .expect("failed to create test schema");
+        let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
+        migrations::run(&schema_database_url)
+            .await
+            .expect("failed to run migrations");
+        sqlx::PgPool::connect(&schema_database_url)
+            .await
+            .expect("failed to connect to schema-scoped test database")
+    }
+
+    async fn seed_project(pool: &sqlx::PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into projects (id, name, description, created_at, updated_at)
+            values ($1, $2, $3, now(), now())
+            "#,
+        )
+        .bind(id)
+        .bind("Research")
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("project should insert");
+        id
+    }
+
+    fn write_parquet_fixture(path: &Path) {
+        let schema = Arc::new(
+            parse_message_type(
+                r#"
+                message dataset {
+                    REQUIRED BYTE_ARRAY audio_path (UTF8);
+                    OPTIONAL BYTE_ARRAY speaker (UTF8);
+                    OPTIONAL BYTE_ARRAY note (UTF8);
+                }
+                "#,
+            )
+            .expect("schema"),
+        );
+        let file = File::create(path).expect("fixture file");
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut writer = SerializedFileWriter::new(file, schema, props).expect("writer");
+        let mut row_group = writer.next_row_group().expect("row group");
+
+        let mut audio_col = row_group.next_column().expect("col").expect("audio col");
+        audio_col
+            .typed::<ByteArrayType>()
+            .write_batch(
+                &[
+                    ByteArray::from("audio/a.wav"),
+                    ByteArray::from("audio/b.wav"),
+                ],
+                None,
+                None,
+            )
+            .expect("audio data");
+        audio_col.close().expect("close audio");
+
+        let mut speaker_col = row_group.next_column().expect("col").expect("speaker col");
+        speaker_col
+            .typed::<ByteArrayType>()
+            .write_batch(
+                &[ByteArray::from("spk-1"), ByteArray::from("spk-2")],
+                Some(&[1, 1]),
+                None,
+            )
+            .expect("speaker data");
+        speaker_col.close().expect("close speaker");
+
+        let mut note_col = row_group.next_column().expect("col").expect("note col");
+        note_col
+            .typed::<ByteArrayType>()
+            .write_batch(
+                &[ByteArray::from("first"), ByteArray::from("second")],
+                Some(&[1, 1]),
+                None,
+            )
+            .expect("note data");
+        note_col.close().expect("close note");
+
+        row_group.close().expect("close row group");
+        writer.close().expect("close file");
+    }
+
+    #[tokio::test]
+    async fn csv_manifest_import_is_incremental_and_idempotent() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        let audio = temp_dir.join("audio.wav");
+        fs::write(&audio, b"audio").expect("audio");
+        let manifest = temp_dir.join("manifest.csv");
+        fs::write(
+            &manifest,
+            "audio_path,speaker,notes\n\
+             audio.wav,spk-1,hello\n",
+        )
+        .expect("manifest");
+
+        let results = import_dataset_manifest(&database, project_id, &manifest, "audio_path")
+            .await
+            .expect("csv import");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].metadata["speaker"], "spk-1");
+        assert_eq!(results[0].metadata["notes"], "hello");
+        assert!(database
+            .sources()
+            .get(results[0].source_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(database
+            .jobs()
+            .get(results[0].job_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let repeated = import_dataset_manifest(&database, project_id, &manifest, "audio_path")
+            .await
+            .expect("csv import again");
+        assert_eq!(repeated.len(), 1);
+        let source_count = database.sources().list(project_id).await.unwrap().len();
+        let job_count = database.jobs().list().await.unwrap().len();
+        assert_eq!(source_count, 1);
+        assert_eq!(job_count, 1);
+    }
+
+    #[tokio::test]
+    async fn jsonl_manifest_import_preserves_extra_metadata_and_reports_missing_files() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        fs::write(temp_dir.join("present.wav"), b"audio").expect("audio");
+        let manifest = temp_dir.join("manifest.jsonl");
+        fs::write(
+            &manifest,
+            r#"{"audio":"present.wav","speaker":"spk-1","extra":{"kind":"field"}}"#.to_string()
+                + "\n"
+                + r#"{"audio":"missing.wav","speaker":"spk-2"}"#,
+        )
+        .expect("manifest");
+
+        let results = import_dataset_manifest(&database, project_id, &manifest, "audio")
+            .await
+            .expect("jsonl import");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].metadata["speaker"], "spk-1");
+        assert_eq!(results[0].metadata["extra"]["kind"], "field");
+    }
+
+    #[tokio::test]
+    async fn parquet_manifest_import_preserves_metadata() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        fs::create_dir_all(temp_dir.join("audio")).expect("dir");
+        fs::write(temp_dir.join("audio/a.wav"), b"audio").expect("audio");
+        let manifest = temp_dir.join("manifest.parquet");
+        write_parquet_fixture(&manifest);
+
+        let results = import_dataset_manifest(&database, project_id, &manifest, "audio_path")
+            .await
+            .expect("parquet import");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].metadata["speaker"], "spk-1");
+        assert_eq!(results[0].metadata["note"], "first");
+    }
+
+    #[tokio::test]
+    async fn archive_import_cleans_up_and_reuses_existing_sources() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        let audio_root = temp_dir.join("dataset");
+        fs::create_dir_all(&audio_root).expect("audio dir");
+        fs::write(audio_root.join("clip.wav"), b"audio").expect("audio");
+        let manifest_path = audio_root.join("manifest.jsonl");
+        fs::write(&manifest_path, r#"{"audio":"clip.wav","speaker":"spk-1"}"#).expect("manifest");
+
+        let archive_root = temp_dir.join("archives");
+        fs::create_dir_all(&archive_root).expect("archive dir");
+        let zip_path = archive_root.join("dataset.zip");
+        {
+            let file = File::create(&zip_path).expect("zip file");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("manifest.jsonl", options).expect("manifest");
+            zip.write_all(br#"{"audio":"clip.wav","speaker":"spk-1"}"#)
+                .expect("write manifest");
+            zip.start_file("clip.wav", options).expect("clip");
+            zip.write_all(b"audio").expect("write audio");
+            zip.finish().expect("finish zip");
+        }
+
+        let workspace_dir = temp_dir.join("workspace");
+        let first = import_archive_dataset(
+            &database,
+            project_id,
+            &zip_path,
+            None,
+            "audio",
+            &workspace_dir,
+        )
+        .await
+        .expect("archive import");
+        assert_eq!(first.len(), 1);
+        assert!(!workspace_dir.join("extract-dataset.zip").exists());
+
+        let second = import_archive_dataset(
+            &database,
+            project_id,
+            &zip_path,
+            None,
+            "audio",
+            &workspace_dir,
+        )
+        .await
+        .expect("archive import again");
+        assert_eq!(second.len(), 1);
+
+        assert_eq!(database.sources().list(project_id).await.unwrap().len(), 1);
+        assert_eq!(database.jobs().list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn archive_import_supports_tar_and_tgz() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        let archive_root = temp_dir.join("archives");
+        fs::create_dir_all(&archive_root).expect("archive dir");
+
+        let tar_path = archive_root.join("dataset.tar");
+        {
+            let file = File::create(&tar_path).expect("tar file");
+            let mut builder = tar::Builder::new(file);
+            let manifest = br#"{"audio":"clip.wav","speaker":"spk-1"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "manifest.jsonl", &manifest[..])
+                .expect("manifest");
+            let audio = b"audio";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(audio.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "clip.wav", &audio[..])
+                .expect("audio");
+            builder.finish().expect("finish tar");
+        }
+
+        let tgz_path = archive_root.join("dataset.tar.gz");
+        {
+            let file = File::create(&tgz_path).expect("tgz file");
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let manifest = br#"{"audio":"clip.wav","speaker":"spk-1"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "manifest.jsonl", &manifest[..])
+                .expect("manifest");
+            let audio = b"audio";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(audio.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "clip.wav", &audio[..])
+                .expect("audio");
+            let encoder = builder.into_inner().expect("builder");
+            encoder.finish().expect("finish tgz");
+        }
+
+        for archive in [&tar_path, &tgz_path] {
+            let results = import_archive_dataset(
+                &database,
+                project_id,
+                archive,
+                None,
+                "audio",
+                temp_dir.as_path(),
+            )
+            .await
+            .expect("archive import");
+            assert_eq!(results.len(), 1);
+            assert_eq!(database.sources().list(project_id).await.unwrap().len(), 1);
+            assert_eq!(database.jobs().list().await.unwrap().len(), 1);
+            sqlx::query("truncate table media_assets, sources, jobs restart identity cascade")
+                .execute(database.pool())
+                .await
+                .expect("reset tables");
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_path_traversal_is_rejected() {
+        clear_env();
+        let temp_dir = temp_dir();
+        let zip_path = temp_dir.join("evil.zip");
+        {
+            let file = File::create(&zip_path).expect("zip file");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("../evil.txt", options).expect("file");
+            zip.write_all(b"boom").expect("write");
+            zip.finish().expect("finish zip");
+        }
+
+        let file = File::open(&zip_path).expect("zip file");
+        let mut archive = ZipArchive::new(file).expect("archive");
+        let err = extract_zip(&mut archive, &temp_dir).unwrap_err();
+        assert!(err.to_string().contains("path traversal"));
+    }
 }

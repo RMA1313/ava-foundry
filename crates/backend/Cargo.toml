@@ -21,7 +21,7 @@ csv = "1"
 flate2 = "1"
 tar = "0.4"
 zip = "2"
-parquet = "53"
+parquet = { version = "53", features = ["json"] }
 
 [dev-dependencies]
 assert_cmd = "2"
