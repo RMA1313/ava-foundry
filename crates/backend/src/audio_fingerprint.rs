@@ -88,6 +88,54 @@ impl AudioFingerprintRepository {
         .await?;
         row.as_ref().map(audio_fingerprint_from_row).transpose()
     }
+
+    pub async fn get_by_asset_algorithm_version(
+        &self,
+        audio_asset_id: Uuid,
+        algorithm: &str,
+        algorithm_version: &str,
+    ) -> Result<Option<AudioFingerprint>> {
+        let row = sqlx::query(
+            r#"
+            select id, audio_asset_id, algorithm, algorithm_version, processing_status,
+                   duration_seconds, storage_path, created_at, updated_at
+            from audio_fingerprints
+            where audio_asset_id = $1
+              and algorithm = $2
+              and algorithm_version = $3
+            "#,
+        )
+        .bind(audio_asset_id)
+        .bind(algorithm)
+        .bind(algorithm_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(audio_fingerprint_from_row).transpose()
+    }
+
+    pub async fn list_searchable_index(
+        &self,
+        algorithm: &str,
+        algorithm_version: &str,
+    ) -> Result<Vec<AudioFingerprint>> {
+        let rows = sqlx::query(
+            r#"
+            select id, audio_asset_id, algorithm, algorithm_version, processing_status,
+                   duration_seconds, storage_path, created_at, updated_at
+            from audio_fingerprints
+            where algorithm = $1
+              and algorithm_version = $2
+            order by created_at asc, id asc
+            "#,
+        )
+        .bind(algorithm)
+        .bind(algorithm_version)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(audio_fingerprint_from_row)
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
 fn audio_fingerprint_from_row(row: &PgRow) -> Result<AudioFingerprint> {

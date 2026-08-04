@@ -5,6 +5,7 @@ pub mod db;
 pub mod download;
 pub mod ffmpeg;
 pub mod ffprobe;
+pub mod fingerprint;
 pub mod hf_adapter;
 pub mod http;
 pub mod ingestion;

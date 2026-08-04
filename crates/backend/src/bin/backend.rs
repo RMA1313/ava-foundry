@@ -8,7 +8,8 @@ use backend::{
     server::{self, AppState},
     storage::AudioStorageConfig,
     worker::{
-        DefaultFilesystemMetrics, ExtractionBackpressureGuard, StagingCapacityGuard, WorkerRuntime,
+        fingerprint_handler, DefaultFilesystemMetrics, ExtractionBackpressureGuard,
+        StagingCapacityGuard, WorkerRuntime,
     },
 };
 use tracing::info;
@@ -48,6 +49,10 @@ async fn main() -> Result<()> {
             config.audio_extraction_queue_resume_limit,
             DefaultFilesystemMetrics,
         ))
+        .with_handler(
+            backend::job::JobType::DuplicateDetection,
+            fingerprint_handler(config.fingerprint_executable),
+        )
         .recover_abandoned_temp_outputs(&state)
         .await?;
     server::serve(addr, state).await

@@ -36,6 +36,7 @@ pub struct AppConfig {
     pub audio_extraction_queue_resume_limit: i64,
     pub staging_pause_free_bytes: u64,
     pub staging_resume_free_bytes: u64,
+    pub fingerprint_executable: PathBuf,
     pub audio_normalization_profile: AudioNormalizationProfile,
     pub host: String,
     pub port: u16,
@@ -98,6 +99,10 @@ impl AppConfig {
             .unwrap_or_else(|_| "2147483648".to_string())
             .parse::<u64>()
             .context("DATA_STUDIO_STAGING_RESUME_FREE_BYTES must be a valid u64")?;
+        let fingerprint_executable = PathBuf::from(
+            std::env::var("DATA_STUDIO_FINGERPRINT_EXECUTABLE")
+                .unwrap_or_else(|_| "fingerprint".to_string()),
+        );
         let audio_normalization_profile = AudioNormalizationProfile {
             format: std::env::var("DATA_STUDIO_AUDIO_NORMALIZATION_FORMAT")
                 .unwrap_or_else(|_| "flac".to_string()),
@@ -132,6 +137,7 @@ impl AppConfig {
             audio_extraction_queue_resume_limit,
             staging_pause_free_bytes,
             staging_resume_free_bytes,
+            fingerprint_executable,
             audio_normalization_profile,
             host,
             port,
