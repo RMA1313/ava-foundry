@@ -1,7 +1,9 @@
 use anyhow::Result;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
+use crate::job::JobRepository;
 use crate::project::ProjectRepository;
+use crate::source::SourceRepository;
 
 #[derive(Clone)]
 pub struct Database {
@@ -27,6 +29,14 @@ impl Database {
 
     pub fn projects(&self) -> ProjectRepository {
         ProjectRepository::new(self.pool.clone())
+    }
+
+    pub fn jobs(&self) -> JobRepository {
+        JobRepository::new(self.pool.clone())
+    }
+
+    pub fn sources(&self) -> SourceRepository {
+        SourceRepository::new(self.pool.clone())
     }
 
     pub async fn is_ready(&self) -> bool {
