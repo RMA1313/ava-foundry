@@ -119,7 +119,7 @@ async fn repository_rejects_duplicate_logical_jobs() {
         )
         .await
         .expect("job should be created");
-    let err = repository
+    let second = repository
         .create(
             project_id,
             Some(source_id),
@@ -128,8 +128,16 @@ async fn repository_rejects_duplicate_logical_jobs() {
             Utc::now(),
         )
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("duplicate key"));
+        .expect("job should resolve deterministically");
+    assert_eq!(
+        second.id,
+        repository
+            .get_by_logical_key(project_id, Some(source_id), JobType::AudioExtraction)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    );
 }
 
 #[tokio::test]

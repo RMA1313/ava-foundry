@@ -128,6 +128,48 @@ impl SourceRepository {
         .await?;
         rows.iter().map(source_from_row).collect()
     }
+
+    pub async fn get_by_identity(
+        &self,
+        project_id: Uuid,
+        normalized_identity: &str,
+    ) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            r#"
+            select id, project_id, source_type, original_url,
+                   normalized_identity, import_metadata, created_at, updated_at
+            from sources
+            where project_id = $1 and normalized_identity = $2
+            "#,
+        )
+        .bind(project_id)
+        .bind(normalized_identity)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(source_from_row).transpose()
+    }
+
+    pub async fn update_import_metadata(
+        &self,
+        id: Uuid,
+        import_metadata: Option<&str>,
+    ) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            r#"
+            update sources
+            set import_metadata = $2,
+                updated_at = now()
+            where id = $1
+            returning id, project_id, source_type, original_url,
+                      normalized_identity, import_metadata, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(import_metadata)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(source_from_row).transpose()
+    }
 }
 
 fn normalize_identity(source_type: SourceType, original_url: Option<&str>) -> Result<String> {

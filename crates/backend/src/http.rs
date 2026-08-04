@@ -1,12 +1,12 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::server::AppState;
+use crate::{ingestion, server::AppState};
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -29,6 +29,26 @@ struct ProjectCreateRequest {
 struct ProjectUpdateRequest {
     name: String,
     description: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LocalFileRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct FolderScanRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct CsvImportRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct UrlRegisterRequest {
+    url: String,
 }
 
 #[derive(Serialize)]
@@ -58,6 +78,12 @@ struct ErrorDetail {
     message: String,
 }
 
+#[derive(Serialize)]
+struct RegistrationResponse {
+    source_id: String,
+    job_id: String,
+}
+
 fn error_response(
     status: StatusCode,
     code: &'static str,
@@ -80,6 +106,13 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", get(ready))
         .route("/projects", get(list_projects).post(create_project))
         .route("/projects/:id", get(get_project).put(update_project))
+        .route(
+            "/projects/:id/sources/local-file",
+            post(register_local_file),
+        )
+        .route("/projects/:id/sources/folder-scan", post(scan_folder))
+        .route("/projects/:id/sources/csv-import", post(import_csv))
+        .route("/projects/:id/sources/url", post(register_url))
         .with_state(state)
 }
 
@@ -176,6 +209,83 @@ async fn update_project(
             "project not found",
         )),
     }
+}
+
+async fn register_local_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<LocalFileRequest>,
+) -> Result<Json<RegistrationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let result = ingestion::register_local_file(
+        &state.database,
+        project_id,
+        std::path::Path::new(&payload.path),
+    )
+    .await
+    .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?;
+    Ok(Json(RegistrationResponse {
+        source_id: result.source_id.to_string(),
+        job_id: result.job_id.to_string(),
+    }))
+}
+
+async fn register_url(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UrlRegisterRequest>,
+) -> Result<Json<RegistrationResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let result = ingestion::register_public_url(&state.database, project_id, &payload.url)
+        .await
+        .map_err(|err| {
+            error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+        })?;
+    Ok(Json(RegistrationResponse {
+        source_id: result.source_id.to_string(),
+        job_id: result.job_id.to_string(),
+    }))
+}
+
+async fn scan_folder(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<FolderScanRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let (discovered, created, skipped) = ingestion::scan_folder(
+        &state.database,
+        project_id,
+        std::path::Path::new(&payload.path),
+    )
+    .await
+    .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "discovered": discovered,
+        "created": created,
+        "skipped": skipped,
+    })))
+}
+
+async fn import_csv(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<CsvImportRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let summary = ingestion::import_csv_urls(
+        &state.database,
+        project_id,
+        std::path::Path::new(&payload.path),
+    )
+    .await
+    .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "imported": summary.imported,
+        "duplicate": summary.duplicate,
+        "invalid": summary.invalid,
+        "failed": summary.failed,
+    })))
 }
 
 impl From<crate::project::Project> for ProjectResponse {

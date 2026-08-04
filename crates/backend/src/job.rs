@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobType {
     SourceRegistration,
     MediaIngestion,
@@ -128,6 +128,8 @@ impl JobRepository {
                 worker_id, failure_reason, created_at, updated_at
             )
             values ($1, $2, $3, $4, $5, $6, 0, $7, null, null, null, now(), now())
+            on conflict (project_id, source_id, job_type)
+            do update set updated_at = excluded.updated_at
             returning id, project_id, source_id, job_type, status, priority,
                       attempts, available_at, lease_expires_at, worker_id,
                       failure_reason, created_at, updated_at
@@ -177,6 +179,31 @@ impl JobRepository {
         .await?;
 
         rows.iter().map(job_from_row).collect()
+    }
+
+    pub async fn get_by_logical_key(
+        &self,
+        project_id: Uuid,
+        source_id: Option<Uuid>,
+        job_type: JobType,
+    ) -> Result<Option<Job>> {
+        let row = sqlx::query(
+            r#"
+            select id, project_id, source_id, job_type, status, priority,
+                   attempts, available_at, lease_expires_at, worker_id,
+                   failure_reason, created_at, updated_at
+            from jobs
+            where project_id = $1
+              and source_id is not distinct from $2
+              and job_type = $3
+            "#,
+        )
+        .bind(project_id)
+        .bind(source_id)
+        .bind(job_type.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(job_from_row).transpose()
     }
 
     pub async fn claim_next(

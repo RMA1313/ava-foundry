@@ -1,8 +1,11 @@
 pub mod config;
 pub mod db;
+pub mod download;
 pub mod http;
+pub mod ingestion;
 pub mod job;
 pub mod migrations;
 pub mod project;
 pub mod server;
 pub mod source;
+pub mod worker;
