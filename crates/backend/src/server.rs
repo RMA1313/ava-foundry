@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use axum::Router;
 
 use crate::{db::Database, http};
 

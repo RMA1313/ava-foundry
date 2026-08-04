@@ -1,4 +1,4 @@
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 
 use crate::server::AppState;
@@ -25,4 +25,3 @@ async fn ready(State(state): State<AppState>) -> Json<StatusResponse> {
         status: if ready { "ok" } else { "unavailable" },
     })
 }
-

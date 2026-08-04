@@ -16,9 +16,17 @@ impl AppConfig {
     pub fn load_from_env() -> Result<Self> {
         let database_url = std::env::var("DATA_STUDIO_DATABASE_URL")
             .context("missing required environment variable DATA_STUDIO_DATABASE_URL")?;
-        let workspace_dir = PathBuf::from(std::env::var("DATA_STUDIO_WORKSPACE_DIR").unwrap_or_else(|_| ".".to_string()));
-        let data_dir = PathBuf::from(std::env::var("DATA_STUDIO_DATA_DIR").unwrap_or_else(|_| workspace_dir.join("data").to_string_lossy().into_owned()));
-        let temp_dir = PathBuf::from(std::env::var("DATA_STUDIO_TEMP_DIR").unwrap_or_else(|_| data_dir.join("tmp").to_string_lossy().into_owned()));
+        let workspace_dir = PathBuf::from(
+            std::env::var("DATA_STUDIO_WORKSPACE_DIR").unwrap_or_else(|_| ".".to_string()),
+        );
+        let data_dir = PathBuf::from(
+            std::env::var("DATA_STUDIO_DATA_DIR")
+                .unwrap_or_else(|_| workspace_dir.join("data").to_string_lossy().into_owned()),
+        );
+        let temp_dir = PathBuf::from(
+            std::env::var("DATA_STUDIO_TEMP_DIR")
+                .unwrap_or_else(|_| data_dir.join("tmp").to_string_lossy().into_owned()),
+        );
         let host = std::env::var("DATA_STUDIO_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port = std::env::var("DATA_STUDIO_PORT")
             .unwrap_or_else(|_| "8080".to_string())
@@ -47,4 +55,3 @@ mod tests {
         assert!(err.to_string().contains("DATA_STUDIO_DATABASE_URL"));
     }
 }
-

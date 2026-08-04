@@ -10,4 +10,3 @@ pub fn clear_env() {
         std::env::remove_var(key);
     }
 }
-

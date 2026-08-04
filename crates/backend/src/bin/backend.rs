@@ -1,7 +1,11 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use backend::{config::AppConfig, db::Database, server::{self, AppState}};
+use backend::{
+    config::AppConfig,
+    db::Database,
+    server::{self, AppState},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,4 +14,3 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
     server::serve(addr, AppState { database }).await
 }
-
