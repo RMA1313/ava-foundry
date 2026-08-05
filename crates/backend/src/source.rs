@@ -610,7 +610,7 @@ fn normalize_url(input: &str) -> String {
     without_query.trim_end_matches('/').to_lowercase()
 }
 
-fn source_from_row(row: &PgRow) -> Result<Source> {
+pub(crate) fn source_from_row(row: &PgRow) -> Result<Source> {
     Ok(Source {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,

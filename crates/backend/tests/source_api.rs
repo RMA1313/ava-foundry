@@ -241,3 +241,28 @@ async fn source_api_supports_project_scoped_crud_and_transitions() {
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn url_import_rejects_private_network_targets() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool, "Research").await;
+    let database = Database::from_pool(pool.clone());
+    let app = app(database);
+
+    let response = app
+        .oneshot(
+            Request::post(format!("/projects/{project_id}/sources/url"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"http://127.0.0.1/secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "invalid_request");
+}

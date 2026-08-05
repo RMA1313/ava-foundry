@@ -19,7 +19,7 @@ pub enum JobType {
 }
 
 impl JobType {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::SourceRegistration => "source_registration",
             Self::MediaIngestion => "media_ingestion",
@@ -518,7 +518,7 @@ fn validate_priority(priority: i32) -> Result<()> {
     Ok(())
 }
 
-fn job_from_row(row: &PgRow) -> Result<Job> {
+pub(crate) fn job_from_row(row: &PgRow) -> Result<Job> {
     Ok(Job {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,

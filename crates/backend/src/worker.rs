@@ -569,7 +569,7 @@ async fn handle_media_ingestion_job(
     state: &AppState,
     job: Job,
     staging_dir: &Path,
-    download_adapter: &DownloadCommandAdapter,
+    _download_adapter: &DownloadCommandAdapter,
 ) -> Result<JobOutcome> {
     let source_id = job
         .source_id
@@ -610,16 +610,30 @@ async fn handle_media_ingestion_job(
                 .original_url
                 .as_deref()
                 .ok_or_else(|| anyhow!("public url source missing url"))?;
-            let _staged = download_url_to_staging(
+            let downloaded = match ingestion::download_public_url_to_staging(
                 &state.database,
                 source_id,
                 url,
                 staging_dir,
-                download_adapter,
             )
-            .await?;
+            .await
+            {
+                Ok(downloaded) => downloaded,
+                Err(err) => {
+                    let failure_reason = err.message;
+                    return match err.kind {
+                        ingestion::UrlImportFailureKind::Retryable => Ok(JobOutcome::Retry {
+                            failure_reason,
+                            retry_after: Utc::now() + chrono::Duration::minutes(5),
+                        }),
+                        ingestion::UrlImportFailureKind::Terminal => {
+                            Ok(JobOutcome::Failed { failure_reason })
+                        }
+                    };
+                }
+            };
             let staged_path = staging_dir.join(format!("{}.bin", source_id));
-            let byte_size = staged_path.metadata()?.len();
+            let byte_size = downloaded.byte_size;
             finalize_media_ingestion(
                 &state.database,
                 job.id,
@@ -872,30 +886,6 @@ pub async fn finalize_media_ingestion(
     }
     tx.commit().await?;
     Ok(())
-}
-
-async fn download_url_to_staging(
-    _database: &crate::db::Database,
-    source_id: uuid::Uuid,
-    url: &str,
-    staging_dir: &Path,
-    adapter: &DownloadCommandAdapter,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(staging_dir).await?;
-    let final_path = staging_dir.join(format!("{}.bin", source_id));
-    if final_path.exists() {
-        return Ok(final_path);
-    }
-    let tmp_path = staging_dir.join(format!("{}.part", source_id));
-    let mut process = adapter.start(url, &tmp_path).await?;
-    while let Some(_line) = process.next_progress().await {}
-    let status = process.wait().await?;
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(anyhow!("download process failed"));
-    }
-    tokio::fs::rename(&tmp_path, &final_path).await?;
-    Ok(final_path)
 }
 
 pub fn generate_worker_id() -> String {

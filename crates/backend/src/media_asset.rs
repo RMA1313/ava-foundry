@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, Executor, PgPool, Postgres, Row};
 use uuid::Uuid;
@@ -53,10 +53,56 @@ pub struct MediaAssetUpsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaAssetListFilter {
     pub project_id: Uuid,
+    pub source_id: Option<Uuid>,
     pub ingestion_status: Option<String>,
     pub inspection_status: Option<String>,
     pub extraction_status: Option<String>,
     pub media_kind: Option<String>,
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaAssetSortField {
+    CreatedAt,
+    UpdatedAt,
+    MediaKind,
+    ByteSize,
+}
+
+impl MediaAssetSortField {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+            Self::MediaKind => "media_kind",
+            Self::ByteSize => "byte_size",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "created_at" => Ok(Self::CreatedAt),
+            "updated_at" => Ok(Self::UpdatedAt),
+            "media_kind" => Ok(Self::MediaKind),
+            "byte_size" => Ok(Self::ByteSize),
+            other => Err(anyhow!("invalid media asset sort field: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaAssetListSort {
+    pub field: MediaAssetSortField,
+    pub descending: bool,
+}
+
+impl Default for MediaAssetListSort {
+    fn default() -> Self {
+        Self {
+            field: MediaAssetSortField::CreatedAt,
+            descending: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,15 +232,8 @@ impl MediaAssetRepository {
         row.as_ref().map(media_asset_from_row).transpose()
     }
 
-    pub async fn list_paginated(
-        &self,
-        filter: MediaAssetListFilter,
-        limit: i64,
-        offset: i64,
-    ) -> Result<MediaAssetPage> {
-        let limit = limit.clamp(1, 100);
-        let offset = offset.max(0);
-        let rows = sqlx::query(
+    pub async fn get_in_project(&self, project_id: Uuid, id: Uuid) -> Result<Option<MediaAsset>> {
+        let row = sqlx::query(
             r#"
             select id, project_id, source_id, media_kind, staged_path,
                    original_filename, byte_size, ingestion_status,
@@ -203,20 +242,64 @@ impl MediaAssetRepository {
                    duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
                    created_at, updated_at
             from media_assets
-            where project_id = $1
-              and ($2::text is null or ingestion_status = $2)
-              and ($3::text is null or inspection_status = $3)
-              and ($4::text is null or extraction_status = $4)
-              and ($5::text is null or media_kind = $5)
-            order by created_at asc, id asc
-            limit $6 offset $7
+            where project_id = $1 and id = $2
             "#,
         )
+        .bind(project_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(media_asset_from_row).transpose()
+    }
+
+    pub async fn list_paginated(
+        &self,
+        filter: MediaAssetListFilter,
+        sort: Option<MediaAssetListSort>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<MediaAssetPage> {
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+        let sort = sort.unwrap_or_default();
+        let order_by = format!(
+            "{} {}, id {}",
+            sort.field.as_sql(),
+            if sort.descending { "desc" } else { "asc" },
+            if sort.descending { "desc" } else { "asc" }
+        );
+        let rows = sqlx::query(&format!(
+            r#"
+            select id, project_id, source_id, media_kind, staged_path,
+                   original_filename, byte_size, ingestion_status,
+                   inspection_status, extraction_status, extraction_progress,
+                   extraction_tmp_path, extracted_at, container_format,
+                   duration_seconds, codecs, sample_rate_hz, channels, inspected_at,
+                    created_at, updated_at
+            from media_assets
+            where project_id = $1
+              and ($2::uuid is null or source_id = $2)
+              and ($3::text is null or ingestion_status = $3)
+              and ($4::text is null or inspection_status = $4)
+              and ($5::text is null or extraction_status = $5)
+              and ($6::text is null or media_kind = $6)
+              and ($7::text is null or staged_path ilike $7)
+            order by {order_by}
+            limit $8 offset $9
+            "#
+        ))
         .bind(filter.project_id)
+        .bind(filter.source_id)
         .bind(filter.ingestion_status.as_deref())
         .bind(filter.inspection_status.as_deref())
         .bind(filter.extraction_status.as_deref())
         .bind(filter.media_kind.as_deref())
+        .bind(
+            filter
+                .search
+                .as_ref()
+                .map(|value| format!("%{}%", value.trim())),
+        )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -230,6 +313,27 @@ impl MediaAssetRepository {
             limit: limit as u32,
             offset: offset as u32,
         })
+    }
+
+    pub async fn delete_in_project(&self, project_id: Uuid, id: Uuid) -> Result<u64> {
+        let result = sqlx::query("delete from media_assets where project_id = $1 and id = $2")
+            .bind(project_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn delete_many_in_project(&self, project_id: Uuid, ids: &[Uuid]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("delete from media_assets where project_id = $1 and id = any($2)")
+            .bind(project_id)
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 

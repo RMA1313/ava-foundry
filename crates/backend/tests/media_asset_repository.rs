@@ -150,6 +150,81 @@ async fn repository_round_trip_and_idempotency_work() {
 }
 
 #[tokio::test]
+async fn repository_scopes_gets_and_deletes_to_project() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let (project_id, source_id) = seed_project_and_source(&pool).await;
+    let other_project_id = {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into projects (id, name, description, created_at, updated_at)
+            values ($1, $2, $3, now(), now())
+            "#,
+        )
+        .bind(id)
+        .bind("Other")
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .unwrap();
+        id
+    };
+    let repository = MediaAssetRepository::new(pool.clone());
+    let asset = repository
+        .upsert_ingested(
+            &pool,
+            MediaAssetUpsert {
+                project_id,
+                source_id,
+                media_kind: "video".to_string(),
+                staged_path: "/tmp/staged/source.bin".to_string(),
+                original_filename: Some("source.mp4".to_string()),
+                byte_size: 12,
+                ingestion_status: "ready".to_string(),
+                inspection_status: None,
+                extraction_status: None,
+                extraction_progress: None,
+                extraction_tmp_path: None,
+                extracted_at: None,
+                container_format: None,
+                duration_seconds: None,
+                codecs: None,
+                sample_rate_hz: None,
+                channels: None,
+                inspected_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(repository
+        .get_in_project(other_project_id, asset.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repository
+            .delete_in_project(other_project_id, asset.id)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        repository
+            .delete_in_project(project_id, asset.id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(repository
+        .get_in_project(project_id, asset.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn migration_creates_media_assets_table_with_source_link_and_unique_constraint() {
     support::clear_env();
     let pool = test_pool().await;

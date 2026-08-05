@@ -18,7 +18,7 @@ use crate::{
     duplicate::DuplicateGroupDetails,
     ingestion,
     job::{JobListFilter, JobStatus, JobType},
-    media_asset::{MediaAsset, MediaAssetListFilter},
+    media_asset::{MediaAsset, MediaAssetListFilter, MediaAssetListSort, MediaAssetSortField},
     project::{ProjectListFilter, ProjectListSort, ProjectSortField, ProjectStatus, SortDirection},
     server::AppState,
     source::{SourceListFilter, SourceListSort, SourceSortField, SourceType},
@@ -107,10 +107,19 @@ struct JobListQuery {
 struct MediaAssetListQuery {
     limit: Option<u32>,
     offset: Option<u32>,
+    source_id: Option<String>,
     ingestion_status: Option<String>,
     inspection_status: Option<String>,
     extraction_status: Option<String>,
     media_kind: Option<String>,
+    search: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MediaAssetDeleteQuery {
+    ids: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -431,7 +440,14 @@ pub fn router(state: AppState) -> Router {
             post(cancel_source),
         )
         .route("/projects/:id/jobs", get(list_jobs))
-        .route("/projects/:id/media-assets", get(list_media_assets))
+        .route(
+            "/projects/:id/media-assets",
+            get(list_media_assets).delete(delete_media_assets),
+        )
+        .route(
+            "/projects/:id/media-assets/:media_asset_id",
+            get(get_media_asset).delete(delete_media_asset),
+        )
         .route("/projects/:id/audio-assets", get(list_audio_assets))
         .route(
             "/projects/:id/audio-assets/:audio_asset_id",
@@ -454,6 +470,10 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/:id/uploads/media", post(upload_media))
         .route("/projects/:id/uploads/archive", post(upload_archive))
         .route("/projects/:id/datasets/import", post(import_dataset))
+        .route(
+            "/projects/:id/datasets/preview",
+            post(preview_dataset_import),
+        )
         .layer(middleware::from_fn(request_logging_layer))
         .with_state(state)
 }
@@ -1015,11 +1035,22 @@ async fn list_media_assets(
         .list_paginated(
             MediaAssetListFilter {
                 project_id,
+                source_id: query.source_id.as_deref().map(parse_uuid).transpose()?,
                 ingestion_status: query.ingestion_status.clone(),
                 inspection_status: query.inspection_status.clone(),
                 extraction_status: query.extraction_status.clone(),
                 media_kind: query.media_kind.clone(),
+                search: query.search.clone(),
             },
+            Some(MediaAssetListSort {
+                field: query
+                    .sort
+                    .as_deref()
+                    .map(media_asset_sort_field)
+                    .transpose()?
+                    .unwrap_or(MediaAssetSortField::CreatedAt),
+                descending: matches!(query.direction.as_deref(), Some("desc")),
+            }),
             query.limit.unwrap_or(50) as i64,
             query.offset.unwrap_or(0) as i64,
         )
@@ -1030,6 +1061,72 @@ async fn list_media_assets(
         limit: page.limit,
         offset: page.offset,
     }))
+}
+
+async fn get_media_asset(
+    State(state): State<AppState>,
+    Path((project_id, media_asset_id)): Path<(String, String)>,
+) -> Result<Json<MediaAssetResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let media_asset_id = parse_uuid(&media_asset_id)?;
+    let media_asset = state
+        .database
+        .media_assets()
+        .get_in_project(project_id, media_asset_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "media_asset_not_found",
+                "media asset not found",
+            )
+        })?;
+    Ok(Json(media_asset_response(media_asset)))
+}
+
+async fn delete_media_asset(
+    State(state): State<AppState>,
+    Path((project_id, media_asset_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let media_asset_id = parse_uuid(&media_asset_id)?;
+    let rows = state
+        .database
+        .media_assets()
+        .delete_in_project(project_id, media_asset_id)
+        .await
+        .map_err(database_error)?;
+    if rows == 0 {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "media_asset_not_found",
+            "media asset not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_media_assets(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Query(query): Query<MediaAssetDeleteQuery>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let ids = query
+        .ids
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|value| parse_uuid(value).ok())
+        .collect::<Vec<_>>();
+    let _ = state
+        .database
+        .media_assets()
+        .delete_many_in_project(project_id, &ids)
+        .await
+        .map_err(database_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_audio_assets(
@@ -1870,6 +1967,62 @@ async fn import_dataset(
     }))
 }
 
+async fn preview_dataset_import(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<DatasetImportResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&id)?;
+    let mut file_path: Option<PathBuf> = None;
+    let mut audio_path_field = String::from("audio_path");
+    while let Some(field) = multipart.next_field().await.map_err(|err| {
+        error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+    })? {
+        match field.name().unwrap_or_default() {
+            "file" => {
+                let filename = field.file_name().unwrap_or("dataset");
+                let filename = filename.to_string();
+                let path = persist_staged_upload(&state, project_id, filename, field)
+                    .await
+                    .map_err(|err| {
+                        error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+                    })?;
+                file_path = Some(path);
+            }
+            "audio_path_field" => {
+                audio_path_field = field.text().await.unwrap_or(audio_path_field);
+            }
+            _ => {}
+        }
+    }
+    let file_path = file_path.ok_or_else(|| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing file upload",
+        )
+    })?;
+    let summary = ingestion::preview_dataset_manifest(&file_path, &audio_path_field)
+        .await
+        .map_err(|err| {
+            error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+        })?;
+    Ok(Json(DatasetImportResponse {
+        imported: summary.imported,
+        duplicate: summary.duplicate,
+        invalid: summary.invalid,
+        failed: summary.failed,
+        row_failures: summary
+            .row_failures
+            .into_iter()
+            .map(|failure| RowFailureResponse {
+                row: failure.row,
+                reason: failure.reason,
+            })
+            .collect(),
+    }))
+}
+
 impl From<crate::project::Project> for ProjectResponse {
     fn from(value: crate::project::Project) -> Self {
         Self {
@@ -1949,6 +2102,13 @@ fn parse_job_status(value: &str) -> Result<JobStatus, (StatusCode, Json<ErrorRes
             "invalid job status",
         )),
     }
+}
+
+fn media_asset_sort_field(
+    value: &str,
+) -> Result<MediaAssetSortField, (StatusCode, Json<ErrorResponse>)> {
+    MediaAssetSortField::parse(value)
+        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))
 }
 
 fn source_response(source: crate::source::Source) -> SourceResponse {

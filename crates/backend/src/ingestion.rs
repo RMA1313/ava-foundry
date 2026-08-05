@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -10,10 +11,31 @@ use chrono::Utc;
 use flate2::read::GzDecoder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+use tokio::io::AsyncWriteExt;
+use url::Url;
 use walkdir::WalkDir;
 use zip::read::ZipArchive;
 
 use crate::{db::Database, job::JobType, source::SourceType};
+
+const DEFAULT_URL_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_URL_TOTAL_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_URL_MAX_REDIRECTS: usize = 5;
+const DEFAULT_URL_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_URL_ALLOWED_CONTENT_TYPES: &[&str] = &[
+    "application/octet-stream",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+    "audio/x-wav",
+    "video/mp4",
+    "video/x-matroska",
+    "video/webm",
+];
 
 const MAX_ARCHIVE_FILES: usize = 10_000;
 const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -22,6 +44,43 @@ const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub struct RegistrationResult {
     pub source_id: uuid::Uuid,
     pub job_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlImportFailureKind {
+    Retryable,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlImportError {
+    pub kind: UrlImportFailureKind,
+    pub message: String,
+}
+
+impl UrlImportError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            kind: UrlImportFailureKind::Retryable,
+            message: message.into(),
+        }
+    }
+
+    fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            kind: UrlImportFailureKind::Terminal,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedMedia {
+    pub stored_path: PathBuf,
+    pub sha256: String,
+    pub byte_size: u64,
+    pub content_type: Option<String>,
+    pub filename: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,41 +224,227 @@ pub async fn register_public_url(
     url: &str,
 ) -> Result<RegistrationResult> {
     validate_public_url(url)?;
-    let normalized_identity = format!("url:{}", { normalize_public_url(url) });
-    if let Some(source) = database
-        .sources()
-        .get_by_identity(project_id, &normalized_identity)
-        .await?
+    let normalized_identity = format!("url:{}", normalize_public_url(url));
+    let mut tx = database.pool().begin().await?;
+    let source = match sqlx::query(
+        r#"
+        select id, project_id, source_type, original_url,
+               normalized_identity, source_config, failure_reason, import_metadata,
+               file_count, byte_count, ingestion_status, created_at, updated_at
+        from sources
+        where project_id = $1 and normalized_identity = $2
+        "#,
+    )
+    .bind(project_id)
+    .bind(&normalized_identity)
+    .fetch_optional(&mut *tx)
+    .await?
     {
-        if let Some(job) = database
-            .jobs()
-            .get_by_logical_key(project_id, Some(source.id), JobType::MediaIngestion)
-            .await?
-        {
-            return Ok(RegistrationResult {
-                source_id: source.id,
-                job_id: job.id,
-            });
+        Some(row) => crate::source::source_from_row(&row)?,
+        None => {
+            let id = uuid::Uuid::new_v4();
+            let row = sqlx::query(
+                r#"
+                insert into sources (
+                    id, project_id, source_type, original_url,
+                    normalized_identity, source_config, failure_reason, import_metadata,
+                    file_count, byte_count, ingestion_status, created_at, updated_at
+                )
+                values ($1, $2, $3, $4, $5, null, null, null, 0, 0, 'pending', now(), now())
+                on conflict (project_id, normalized_identity)
+                do update set updated_at = excluded.updated_at
+                returning id, project_id, source_type, original_url,
+                          normalized_identity, source_config, failure_reason, import_metadata,
+                          file_count, byte_count, ingestion_status, created_at, updated_at
+                "#,
+            )
+            .bind(id)
+            .bind(project_id)
+            .bind(SourceType::PublicUrl.as_str())
+            .bind(Some(url))
+            .bind(&normalized_identity)
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::source::source_from_row(&row)?
         }
-    }
-    let source = database
-        .sources()
-        .create(project_id, SourceType::PublicUrl, Some(url), None, None)
-        .await?;
-    let job = database
-        .jobs()
-        .create(
-            project_id,
-            Some(source.id),
-            JobType::MediaIngestion,
-            0,
-            Utc::now(),
-        )
-        .await?;
+    };
+    let job = match sqlx::query(
+        r#"
+        select id, project_id, source_id, job_type, status, priority,
+               attempts, available_at, lease_expires_at, worker_id,
+               failure_reason, created_at, updated_at
+        from jobs
+        where project_id = $1 and source_id = $2 and job_type = $3
+        "#,
+    )
+    .bind(project_id)
+    .bind(source.id)
+    .bind(JobType::MediaIngestion.as_str())
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        Some(row) => crate::job::job_from_row(&row)?,
+        None => {
+            let id = uuid::Uuid::new_v4();
+            let row = sqlx::query(
+                r#"
+                insert into jobs (
+                    id, project_id, source_id, job_type, status,
+                    priority, attempts, available_at, lease_expires_at,
+                    worker_id, failure_reason, created_at, updated_at
+                )
+                values ($1, $2, $3, $4, $5, 0, 0, now(), null, null, null, now(), now())
+                on conflict (project_id, source_id, job_type)
+                do update set updated_at = excluded.updated_at
+                returning id, project_id, source_id, job_type, status, priority,
+                          attempts, available_at, lease_expires_at, worker_id,
+                          failure_reason, created_at, updated_at
+                "#,
+            )
+            .bind(id)
+            .bind(project_id)
+            .bind(source.id)
+            .bind(JobType::MediaIngestion.as_str())
+            .bind("queued")
+            .fetch_one(&mut *tx)
+            .await?;
+            crate::job::job_from_row(&row)?
+        }
+    };
+    tx.commit().await?;
     Ok(RegistrationResult {
         source_id: source.id,
         job_id: job.id,
     })
+}
+
+pub async fn download_public_url_to_staging(
+    _database: &Database,
+    source_id: uuid::Uuid,
+    url: &str,
+    staging_dir: &Path,
+) -> Result<DownloadedMedia, UrlImportError> {
+    let temp_path = staging_dir.join(format!("{}.part", source_id));
+    let final_path = staging_dir.join(format!("{}.bin", source_id));
+    let result = async {
+        tokio::fs::create_dir_all(staging_dir)
+            .await
+            .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+        if final_path.exists() {
+            let size = tokio::fs::metadata(&final_path)
+                .await
+                .map_err(|err| UrlImportError::retryable(err.to_string()))?
+                .len();
+            return Ok(DownloadedMedia {
+                stored_path: final_path,
+                sha256: String::new(),
+                byte_size: size,
+                content_type: None,
+                filename: safe_filename_from_url(url),
+            });
+        }
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let mut current_url = url.to_string();
+        let mut redirects = 0usize;
+        let mut resolved_filename = safe_filename_from_url(url);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(default_url_total_timeout_secs());
+        loop {
+            if redirects > DEFAULT_URL_MAX_REDIRECTS {
+                return Err(UrlImportError::terminal("too many redirects"));
+            }
+            let parsed =
+                Url::parse(&current_url).map_err(|_| UrlImportError::terminal("invalid url"))?;
+            let validation = validate_resolved_url(&parsed).await?;
+            let req = validation
+                .client
+                .get(parsed.as_str())
+                .timeout(Duration::from_secs(default_url_connect_timeout_secs()));
+            let response = tokio::time::timeout_at(deadline, req.send())
+                .await
+                .map_err(|_| UrlImportError::retryable("download timed out"))?
+                .map_err(classify_reqwest_error)?;
+            if response.status().is_redirection() {
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| UrlImportError::terminal("redirect missing location"))?;
+                let next_url = parsed
+                    .join(next)
+                    .map_err(|_| UrlImportError::terminal("invalid redirect target"))?;
+                validate_public_url(next_url.as_str())
+                    .map_err(|err| UrlImportError::terminal(err.to_string()))?;
+                current_url = next_url.to_string();
+                redirects += 1;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(UrlImportError::terminal(format!(
+                    "unexpected http status {}",
+                    response.status()
+                )));
+            }
+            let response_content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            validate_content_type(response_content_type.as_deref())
+                .map_err(|err| UrlImportError::terminal(err.to_string()))?;
+            if let Some(disposition) = response
+                .headers()
+                .get(reqwest::header::CONTENT_DISPOSITION)
+                .and_then(|value| value.to_str().ok())
+            {
+                if let Some(filename) = disposition_filename(disposition) {
+                    resolved_filename = filename;
+                }
+            }
+            let mut response = response;
+            let mut file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+            while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+                .await
+                .map_err(|_| UrlImportError::retryable("download timed out"))?
+                .map_err(classify_reqwest_error)?
+            {
+                total = total
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| UrlImportError::terminal("response too large"))?;
+                if total > default_url_max_bytes() {
+                    return Err(UrlImportError::terminal("response too large"));
+                }
+                hasher.update(&chunk);
+                tokio::time::timeout_at(deadline, async {
+                    tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
+                })
+                .await
+                .map_err(|_| UrlImportError::retryable("download timed out"))?
+                .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+            }
+            file.flush()
+                .await
+                .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+            tokio::fs::rename(&temp_path, &final_path)
+                .await
+                .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+            break Ok(DownloadedMedia {
+                stored_path: final_path,
+                sha256: format!("{:x}", hasher.finalize()),
+                byte_size: total,
+                content_type: response_content_type,
+                filename: resolved_filename,
+            });
+        }
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result
 }
 
 pub async fn scan_folder(
@@ -688,6 +933,125 @@ pub async fn import_dataset_manifest(
     Ok(results)
 }
 
+pub async fn preview_dataset_manifest(
+    manifest_path: &Path,
+    audio_path_field: &str,
+) -> Result<CsvImportSummary> {
+    let mut summary = CsvImportSummary {
+        imported: 0,
+        duplicate: 0,
+        invalid: 0,
+        failed: 0,
+        row_failures: Vec::new(),
+    };
+    match manifest_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("csv") => {
+            let mut reader = csv::Reader::from_path(manifest_path)?;
+            let headers = reader.headers()?.clone();
+            let audio_index = headers
+                .iter()
+                .position(|h| h.trim() == audio_path_field)
+                .ok_or_else(|| anyhow!("manifest missing audio path field"))?;
+            for (row_index, record) in reader.records().enumerate() {
+                let row = (row_index + 2) as u32;
+                match record {
+                    Ok(record) => {
+                        if record.get(audio_index).unwrap_or("").trim().is_empty() {
+                            summary.invalid += 1;
+                            summary.row_failures.push(RowFailure {
+                                row,
+                                reason: "missing audio path".to_string(),
+                            });
+                        } else {
+                            summary.imported += 1;
+                        }
+                    }
+                    Err(_) => {
+                        summary.failed += 1;
+                        summary.row_failures.push(RowFailure {
+                            row,
+                            reason: "invalid CSV row".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Some("jsonl") | Some("json") => {
+            let file = fs::File::open(manifest_path)?;
+            for (row_index, line) in BufReader::new(file).lines().enumerate() {
+                let row = (row_index + 1) as u32;
+                match line {
+                    Ok(line) if !line.trim().is_empty() => {
+                        match serde_json::from_str::<Value>(&line) {
+                            Ok(record) if record.as_object().is_some() => {
+                                let path = record
+                                    .get(audio_path_field)
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("")
+                                    .trim();
+                                if path.is_empty() {
+                                    summary.invalid += 1;
+                                    summary.row_failures.push(RowFailure {
+                                        row,
+                                        reason: "missing audio path".to_string(),
+                                    });
+                                } else {
+                                    summary.imported += 1;
+                                }
+                            }
+                            _ => {
+                                summary.failed += 1;
+                                summary.row_failures.push(RowFailure {
+                                    row,
+                                    reason: "invalid JSON row".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        summary.failed += 1;
+                        summary.row_failures.push(RowFailure {
+                            row,
+                            reason: "invalid manifest row".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Some("parquet") => {
+            let file = fs::File::open(manifest_path)?;
+            let reader = SerializedFileReader::new(file)?;
+            let iter = reader.get_row_iter(None)?;
+            for row in iter {
+                let row = row?;
+                let record = row.to_json_value();
+                let path = record
+                    .get(audio_path_field)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if path.is_empty() {
+                    summary.invalid += 1;
+                    summary.row_failures.push(RowFailure {
+                        row: summary.imported + summary.invalid + summary.failed + 1,
+                        reason: "missing audio path".to_string(),
+                    });
+                } else {
+                    summary.imported += 1;
+                }
+            }
+        }
+        _ => return Err(anyhow!("unsupported manifest format")),
+    }
+    Ok(summary)
+}
+
 pub async fn import_archive_dataset(
     database: &Database,
     project_id: uuid::Uuid,
@@ -779,7 +1143,15 @@ async fn register_manifest_path(
         .get_by_identity(project_id, &normalized_identity)
         .await?
     {
-        Some(existing) => existing,
+        Some(existing) => {
+            if existing.import_metadata.as_deref() != Some(&metadata.to_string()) {
+                let _ = database
+                    .sources()
+                    .update_import_metadata(existing.id, Some(&metadata.to_string()))
+                    .await?;
+            }
+            existing
+        }
         None => {
             database
                 .sources()
@@ -971,12 +1343,190 @@ fn safe_join(base: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn validate_public_url(url: &str) -> Result<()> {
-    let trimmed = url.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    let parsed = Url::parse(url.trim()).map_err(|_| anyhow!("invalid url"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err(anyhow!("url must start with http:// or https://")),
+    }
+    if let Some(host) = parsed.host_str() {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_blocked_ip(&ip) && !is_allowed_test_loopback(&ip) {
+                return Err(anyhow!("url target is not allowed"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_url_connect_timeout_secs() -> u64 {
+    std::env::var("DATA_STUDIO_URL_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_URL_CONNECT_TIMEOUT_SECS)
+}
+
+fn default_url_total_timeout_secs() -> u64 {
+    std::env::var("DATA_STUDIO_URL_TOTAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_URL_TOTAL_TIMEOUT_SECS)
+}
+
+fn default_url_max_bytes() -> u64 {
+    std::env::var("DATA_STUDIO_URL_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_URL_MAX_BYTES)
+}
+
+struct ValidatedConnection {
+    client: reqwest::Client,
+}
+
+async fn validate_resolved_url(url: &Url) -> Result<ValidatedConnection, UrlImportError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| UrlImportError::terminal("url missing host"))?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| UrlImportError::terminal("url missing port"))?;
+    let addrs = tokio::time::timeout(
+        Duration::from_secs(default_url_connect_timeout_secs()),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| UrlImportError::retryable("dns lookup timed out"))?
+    .map_err(|err| UrlImportError::retryable(err.to_string()))?
+    .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(UrlImportError::retryable("no dns results"));
+    }
+    if addrs
+        .iter()
+        .any(|addr| is_blocked_ip(&addr.ip()) && !is_allowed_test_loopback(&addr.ip()))
+    {
+        return Err(UrlImportError::terminal("url target is not allowed"));
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|err| UrlImportError::retryable(err.to_string()))?;
+    Ok(ValidatedConnection { client })
+}
+
+fn classify_reqwest_error(err: reqwest::Error) -> UrlImportError {
+    if err.is_timeout() || err.is_connect() || err.is_request() {
+        UrlImportError::retryable(err.to_string())
+    } else if err.is_status() {
+        UrlImportError::terminal(err.to_string())
+    } else {
+        UrlImportError::retryable(err.to_string())
+    }
+}
+
+fn validate_content_type(content_type: Option<&str>) -> Result<()> {
+    let content_type = match content_type {
+        Some(value) => value.split(';').next().unwrap_or(value).trim(),
+        None => return Ok(()),
+    };
+    if DEFAULT_URL_ALLOWED_CONTENT_TYPES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(content_type))
+    {
         Ok(())
     } else {
-        Err(anyhow!("url must start with http:// or https://"))
+        Err(anyhow!("content type not allowed"))
     }
+}
+
+fn safe_filename_from_url(url: &str) -> String {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(|value| value.to_string())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| sanitize_filename(&value))
+        .unwrap_or_else(|| "download.bin".to_string())
+}
+
+fn disposition_filename(disposition: &str) -> Option<String> {
+    disposition
+        .split(';')
+        .find_map(|part| {
+            let part = part.trim();
+            part.strip_prefix("filename=").map(|value| {
+                value
+                    .trim_matches('"')
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(value)
+                    .to_string()
+            })
+        })
+        .map(|value| sanitize_filename(&value))
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let mut sanitized = value
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        sanitized = "download.bin".to_string();
+    }
+    sanitized
+}
+
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+        }
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_unspecified()
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_loopback_allowlist() -> &'static Mutex<std::collections::HashSet<std::net::IpAddr>> {
+    static TEST_LOOPBACK_ALLOWLIST: OnceLock<Mutex<std::collections::HashSet<std::net::IpAddr>>> =
+        OnceLock::new();
+    TEST_LOOPBACK_ALLOWLIST.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub fn register_test_loopback(ip: std::net::IpAddr) {
+    if ip.is_loopback() {
+        let _ = test_loopback_allowlist().lock().unwrap().insert(ip);
+    }
+}
+
+#[cfg(test)]
+fn is_allowed_test_loopback(ip: &std::net::IpAddr) -> bool {
+    ip.is_loopback() && test_loopback_allowlist().lock().unwrap().contains(ip)
+}
+
+#[cfg(not(test))]
+fn is_allowed_test_loopback(_: &std::net::IpAddr) -> bool {
+    false
 }
 
 pub fn validate_regular_file(path: &Path) -> Result<()> {
@@ -1048,6 +1598,13 @@ fn find_supported_manifest(root: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::migrations;
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, Uri},
+        response::{IntoResponse, Redirect},
+        routing::get,
+        Router,
+    };
     use flate2::{write::GzEncoder, Compression};
     use parquet::{
         data_type::{ByteArray, ByteArrayType},
@@ -1063,6 +1620,18 @@ mod tests {
 
     async fn lock_db_tests() -> tokio::sync::MutexGuard<'static, ()> {
         DB_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    async fn db_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        lock_db_tests().await
+    }
+
+    async fn url_import_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static URL_IMPORT_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        URL_IMPORT_TEST_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await
@@ -1095,7 +1664,7 @@ mod tests {
             });
         let schema_name = format!("ingestion_manifest_test_{}", Uuid::new_v4().simple());
         let admin_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect(&database_url)
             .await
             .expect("failed to connect to test database");
@@ -1109,7 +1678,7 @@ mod tests {
             .await
             .expect("failed to run migrations");
         sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(1)
             .connect(&schema_database_url)
             .await
             .expect("failed to connect to schema-scoped test database")
@@ -1130,6 +1699,81 @@ mod tests {
         .await
         .expect("project should insert");
         id
+    }
+
+    async fn seed_public_source(pool: &sqlx::PgPool, project_id: Uuid, url: &str) -> Uuid {
+        let source_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            insert into sources (
+                id, project_id, source_type, original_url, normalized_identity,
+                source_config, failure_reason, import_metadata, file_count,
+                byte_count, ingestion_status, created_at, updated_at
+            )
+            values ($1, $2, $3, $4, $5, null, null, null, 0, 0, 'pending', now(), now())
+            "#,
+        )
+        .bind(source_id)
+        .bind(project_id)
+        .bind("public_url")
+        .bind(Some(url))
+        .bind(format!("url:{}", normalize_public_url(url)))
+        .execute(pool)
+        .await
+        .expect("source should insert");
+        source_id
+    }
+
+    async fn start_http_server() -> std::net::SocketAddr {
+        async fn file() -> impl IntoResponse {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            (headers, Body::from("hello world"))
+        }
+
+        async fn html() -> impl IntoResponse {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html"),
+            );
+            (headers, Body::from("<html></html>"))
+        }
+
+        async fn big() -> impl IntoResponse {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            (headers, Body::from(vec![b'a'; 32]))
+        }
+
+        async fn slow() -> impl IntoResponse {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            file().await
+        }
+
+        async fn redirect(uri: Uri) -> impl IntoResponse {
+            let target = uri.query().unwrap_or("/file");
+            Redirect::temporary(target)
+        }
+
+        let app = Router::new()
+            .route("/file", get(file))
+            .route("/html", get(html))
+            .route("/big", get(big))
+            .route("/slow", get(slow))
+            .route("/redirect", get(redirect));
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
     }
 
     fn write_parquet_fixture(path: &Path) {
@@ -1193,6 +1837,7 @@ mod tests {
     #[tokio::test]
     async fn csv_manifest_import_is_incremental_and_idempotent() {
         clear_env();
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1237,8 +1882,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn csv_manifest_preview_reports_row_failures_without_writing_rows() {
+        clear_env();
+        let _guard = db_test_guard().await;
+        let pool = test_pool().await;
+        let temp_dir = temp_dir();
+        let manifest = temp_dir.join("preview.csv");
+        fs::write(&manifest, "audio_path,title\nexists.wav,Hello\n,Missing\n").expect("manifest");
+
+        let preview = preview_dataset_manifest(&manifest, "audio_path")
+            .await
+            .expect("preview");
+        assert_eq!(preview.imported, 1);
+        assert_eq!(preview.invalid, 1);
+        assert_eq!(preview.failed, 0);
+        assert_eq!(preview.row_failures.len(), 1);
+        let count = sqlx::query_scalar::<_, i64>("select count(*) from sources")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn jsonl_manifest_import_preserves_extra_metadata_and_reports_missing_files() {
         clear_env();
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1264,6 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn parquet_manifest_import_preserves_metadata() {
         clear_env();
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1284,6 +1954,7 @@ mod tests {
     #[tokio::test]
     async fn folder_scan_rejects_paths_outside_approved_roots() {
         clear_env();
+        let _guard = db_test_guard().await;
         let temp_dir = temp_dir();
         std::env::set_var(
             "DATA_STUDIO_FOLDER_SCAN_ROOTS",
@@ -1298,6 +1969,7 @@ mod tests {
     #[tokio::test]
     async fn folder_scan_is_recursive_idempotent_and_persists_summary() {
         clear_env();
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1347,7 +2019,7 @@ mod tests {
     #[tokio::test]
     async fn archive_import_cleans_up_and_reuses_existing_sources() {
         clear_env();
-        let _guard = lock_db_tests().await;
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1406,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn archive_import_supports_tar_and_tgz() {
         clear_env();
-        let _guard = lock_db_tests().await;
+        let _guard = db_test_guard().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1502,6 +2174,7 @@ mod tests {
     #[tokio::test]
     async fn archive_import_rejects_corrupt_and_unsupported_files_without_leaking_temp_dirs() {
         clear_env();
+        let _guard = db_test_guard().await;
         let temp_dir = temp_dir();
         let workspace = temp_dir.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
@@ -1514,6 +2187,7 @@ mod tests {
     #[tokio::test]
     async fn archive_import_rejects_archive_bombs_by_file_count() {
         clear_env();
+        let _guard = db_test_guard().await;
         let temp_dir = temp_dir();
         let archive_path = temp_dir.join("bomb.zip");
         {
@@ -1529,5 +2203,194 @@ mod tests {
         }
         let err = extract_archive(&archive_path, &temp_dir).await.unwrap_err();
         assert!(err.to_string().contains("file count limit"));
+    }
+
+    #[tokio::test]
+    async fn public_url_download_follows_redirects_and_is_idempotent() {
+        clear_env();
+        let _url_guard = url_import_test_guard().await;
+        let _guard = db_test_guard().await;
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let server = start_http_server().await;
+        register_test_loopback(server.ip());
+        let server_url = format!("http://{}", server);
+        let source_id =
+            seed_public_source(&pool, project_id, &format!("{server_url}/redirect?/file")).await;
+        let staging = temp_dir();
+
+        let first = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{server_url}/redirect?/file"),
+            &staging,
+        )
+        .await
+        .expect("download");
+        let second = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{server_url}/redirect?/file"),
+            &staging,
+        )
+        .await
+        .expect("download again");
+
+        assert_eq!(first.stored_path, second.stored_path);
+        assert!(first.byte_size > 0);
+        assert!(!first.sha256.is_empty());
+        assert!(first.stored_path.exists());
+    }
+
+    #[tokio::test]
+    async fn public_url_download_rejects_private_targets_and_invalid_content_type() {
+        clear_env();
+        let _url_guard = url_import_test_guard().await;
+        let _guard = db_test_guard().await;
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let server = start_http_server().await;
+        register_test_loopback(server.ip());
+        let server_url = format!("http://{}", server);
+        let private_source =
+            seed_public_source(&pool, project_id, "http://127.0.0.1/private").await;
+        let staging = temp_dir();
+
+        let private_err = download_public_url_to_staging(
+            &database,
+            private_source,
+            "http://127.0.0.1/private",
+            &staging,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(private_err.kind, UrlImportFailureKind::Terminal));
+
+        let html_source =
+            seed_public_source(&pool, project_id, &format!("{server_url}/html")).await;
+        let html_err = download_public_url_to_staging(
+            &database,
+            html_source,
+            &format!("{server_url}/html"),
+            &staging,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(html_err.kind, UrlImportFailureKind::Terminal));
+    }
+
+    #[tokio::test]
+    async fn public_url_download_retries_on_timeout_and_cleans_up_partial_files() {
+        clear_env();
+        let _url_guard = url_import_test_guard().await;
+        let _guard = db_test_guard().await;
+        std::env::set_var("DATA_STUDIO_URL_TOTAL_TIMEOUT_SECS", "1");
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let server = start_http_server().await;
+        register_test_loopback(server.ip());
+        let server_url = format!("http://{}", server);
+        let source_id = seed_public_source(&pool, project_id, &format!("{server_url}/slow")).await;
+        let staging = temp_dir();
+
+        let err = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{server_url}/slow"),
+            &staging,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.kind, UrlImportFailureKind::Retryable));
+        assert!(!staging.join(format!("{}.part", source_id)).exists());
+        std::env::remove_var("DATA_STUDIO_URL_TOTAL_TIMEOUT_SECS");
+    }
+
+    #[tokio::test]
+    async fn public_url_download_enforces_size_limits() {
+        clear_env();
+        let _url_guard = url_import_test_guard().await;
+        let _guard = db_test_guard().await;
+        std::env::set_var("DATA_STUDIO_URL_MAX_BYTES", "8");
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let server = start_http_server().await;
+        register_test_loopback(server.ip());
+        let server_url = format!("http://{}", server);
+        let source_id = seed_public_source(&pool, project_id, &format!("{server_url}/big")).await;
+        let staging = temp_dir();
+
+        let err = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{server_url}/big"),
+            &staging,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err.kind, UrlImportFailureKind::Terminal));
+        assert!(!staging.join(format!("{}.part", source_id)).exists());
+        std::env::remove_var("DATA_STUDIO_URL_MAX_BYTES");
+    }
+
+    #[tokio::test]
+    async fn public_url_download_revalidates_redirect_targets_and_retries_idempotently() {
+        clear_env();
+        let _url_guard = url_import_test_guard().await;
+        let _guard = db_test_guard().await;
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let redirect_server = start_http_server().await;
+        register_test_loopback(redirect_server.ip());
+        let redirect_url = format!("http://{}", redirect_server);
+        let blocked_target = "http://127.0.0.1:65535/file";
+        let redirect_source = seed_public_source(
+            &pool,
+            project_id,
+            &format!("{redirect_url}/redirect?{blocked_target}"),
+        )
+        .await;
+        let staging = temp_dir();
+
+        let blocked = download_public_url_to_staging(
+            &database,
+            redirect_source,
+            &format!("{redirect_url}/redirect?{blocked_target}"),
+            &staging,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(blocked.kind, UrlImportFailureKind::Terminal));
+        assert!(!staging.join(format!("{}.part", redirect_source)).exists());
+
+        let file_server = start_http_server().await;
+        register_test_loopback(file_server.ip());
+        let file_url = format!("http://{}", file_server);
+        let source_id = seed_public_source(&pool, project_id, &format!("{file_url}/file")).await;
+        let first = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{file_url}/file"),
+            &staging,
+        )
+        .await
+        .expect("download should succeed");
+        let second = download_public_url_to_staging(
+            &database,
+            source_id,
+            &format!("{file_url}/file"),
+            &staging,
+        )
+        .await
+        .expect("download should be idempotent");
+        assert_eq!(first.stored_path, second.stored_path);
+        assert_eq!(first.byte_size, second.byte_size);
+        assert!(first.stored_path.exists());
+        assert!(!first.sha256.is_empty());
     }
 }

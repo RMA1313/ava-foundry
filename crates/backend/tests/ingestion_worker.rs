@@ -19,6 +19,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{env, fs, path::Path, sync::Arc};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration, Instant};
 use uuid::Uuid;
 
 async fn test_pool() -> PgPool {
@@ -65,27 +66,22 @@ async fn seed_project(pool: &PgPool) -> Uuid {
     id
 }
 
-fn fake_downloader(dir: &TempDir) -> std::path::PathBuf {
-    let path = dir.path().join("fake-yt-dlp");
-    fs::write(
-        &path,
-        r#"#!/bin/sh
-out="$4"
-echo "10%"
-echo "50%"
-echo "100%"
-printf "downloaded" > "$out"
-"#,
-    )
-    .expect("script should write");
-    #[cfg(unix)]
-    {
-        let mut perms = fs::metadata(&path).expect("metadata").permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).expect("permissions");
+async fn wait_for_job_completion(
+    database: &Database,
+    job_id: Uuid,
+    timeout: Duration,
+) -> backend::job::JobStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let fetched = database.jobs().get(job_id).await.unwrap().unwrap();
+        if fetched.status != JobStatus::Running && fetched.status != JobStatus::Queued {
+            return fetched.status;
+        }
+        if Instant::now() >= deadline {
+            return fetched.status;
+        }
+        sleep(Duration::from_millis(50)).await;
     }
-    path
 }
 
 #[tokio::test]
@@ -94,12 +90,15 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
     let pool = test_pool().await;
     let project_id = seed_project(&pool).await;
     let database = Database::from_pool(pool.clone());
+    let temp_dir = TempDir::new().expect("temp dir");
+    let source_path = temp_dir.path().join("input.wav");
+    fs::write(&source_path, b"downloaded").expect("source file");
     let source = database
         .sources()
         .create(
             project_id,
-            SourceType::PublicUrl,
-            Some("https://youtu.be/abcd1234"),
+            SourceType::LocalFile,
+            Some(source_path.to_string_lossy().as_ref()),
             None,
             None,
         )
@@ -116,15 +115,13 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
         )
         .await
         .expect("job should be created");
-    let temp_dir = TempDir::new().expect("temp dir");
-    let executable = fake_downloader(&temp_dir);
     let database_for_runtime = database.clone();
     let runtime = WorkerRuntime::new("worker-test".to_string())
         .with_handler(
             JobType::MediaIngestion,
             media_ingestion_handler(
                 temp_dir.path(),
-                backend::download::DownloadCommandAdapter::new(executable).unwrap(),
+                backend::download::DownloadCommandAdapter::new("/bin/true").unwrap(),
             ),
         )
         .with_poll_interval(std::time::Duration::from_millis(5));
@@ -146,19 +143,13 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
             })
             .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let fetched_status =
+        wait_for_job_completion(&database_for_runtime, job.id, Duration::from_secs(30)).await;
+    assert_eq!(fetched_status, JobStatus::Completed);
     let _ = shutdown_tx.send(());
     run.await
         .expect("task should join")
         .expect("runtime should succeed");
-
-    let fetched = database_for_runtime
-        .jobs()
-        .get(job.id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(fetched.status, JobStatus::Completed);
     let source = database_for_runtime
         .sources()
         .get(source.id)
@@ -173,7 +164,7 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
         .unwrap()
         .unwrap();
     assert_eq!(asset.project_id, project_id);
-    assert_eq!(asset.media_kind, "video");
+    assert_eq!(asset.media_kind, "file");
     let staged = temp_dir.path().join(format!("{}.bin", source.id));
     assert!(Path::new(&staged).exists());
 }
@@ -223,12 +214,15 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
     let pool = test_pool().await;
     let project_id = seed_project(&pool).await;
     let database = Database::from_pool(pool.clone());
+    let temp_dir = TempDir::new().expect("temp dir");
+    let source_path = temp_dir.path().join("input.wav");
+    fs::write(&source_path, b"downloaded").expect("source file");
     let source = database
         .sources()
         .create(
             project_id,
-            SourceType::PublicUrl,
-            Some("https://youtu.be/abcd1234"),
+            SourceType::LocalFile,
+            Some(source_path.to_string_lossy().as_ref()),
             None,
             None,
         )
@@ -246,10 +240,9 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
         .await
         .expect("job should be created");
     let temp_dir = TempDir::new().expect("temp dir");
-    let executable = fake_downloader(&temp_dir);
     let handler = media_ingestion_handler(
         temp_dir.path(),
-        backend::download::DownloadCommandAdapter::new(executable).unwrap(),
+        backend::download::DownloadCommandAdapter::new("/bin/true").unwrap(),
     );
     let state = AppState {
         database,

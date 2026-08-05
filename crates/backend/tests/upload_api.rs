@@ -162,3 +162,50 @@ async fn upload_api_rejects_path_traversal_filenames() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"]["code"], "invalid_request");
 }
+
+#[tokio::test]
+async fn dataset_preview_reports_validation_without_creating_records() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let project_id = seed_project(&pool).await;
+    let database = Database::from_pool(pool.clone());
+    let temp_dir = TempDir::new().unwrap();
+    let manifest = temp_dir.path().join("manifest.csv");
+    std::fs::write(&manifest, "audio_path,title\nsample.wav,Hello\n,Missing\n").unwrap();
+    let app = app(database, temp_dir.path().to_path_buf());
+    let boundary = "X-BOUNDARY";
+    let body = multipart_body(
+        boundary,
+        &[(
+            "file",
+            "manifest.csv",
+            "text/csv",
+            "audio_path,title\nsample.wav,Hello\n,Missing\n",
+        )],
+    );
+
+    let response = app
+        .oneshot(
+            Request::post(format!("/projects/{project_id}/datasets/preview"))
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["imported"], 1);
+    assert_eq!(json["invalid"], 1);
+    let source_count = sqlx::query_scalar::<_, i64>("select count(*) from sources")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_count, 0);
+}

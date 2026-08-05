@@ -23,6 +23,8 @@ tar = "0.4"
 zip = "2"
 parquet = { version = "53", features = ["json"] }
 sha2 = "0.10"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 assert_cmd = "2"
