@@ -142,6 +142,9 @@ The most important metrics are:
 - GPU utilization
 - Pipeline bottlenecks
 
+The current frontend only renders metrics that are directly backed by the backend response shape.
+Unsupported operational signals are omitted from the UI rather than approximated with placeholders.
+
 Category durations are considered the primary business KPI.
 
 ---
