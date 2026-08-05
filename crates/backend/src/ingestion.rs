@@ -1753,7 +1753,7 @@ mod tests {
         }
 
         async fn slow() -> impl IntoResponse {
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             file().await
         }
 
@@ -2286,7 +2286,7 @@ mod tests {
         clear_env();
         let _url_guard = url_import_test_guard().await;
         let _guard = db_test_guard().await;
-        std::env::set_var("DATA_STUDIO_URL_TOTAL_TIMEOUT_SECS", "1");
+        std::env::set_var("DATA_STUDIO_URL_TOTAL_TIMEOUT_SECS", "0");
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());

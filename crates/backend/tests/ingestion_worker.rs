@@ -80,7 +80,7 @@ async fn wait_for_job_completion(
         if Instant::now() >= deadline {
             return fetched.status;
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -144,7 +144,7 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
             .await
     });
     let fetched_status =
-        wait_for_job_completion(&database_for_runtime, job.id, Duration::from_secs(30)).await;
+        wait_for_job_completion(&database_for_runtime, job.id, Duration::from_secs(10)).await;
     assert_eq!(fetched_status, JobStatus::Completed);
     let _ = shutdown_tx.send(());
     run.await
