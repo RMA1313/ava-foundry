@@ -972,7 +972,7 @@ mod tests {
         let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
             .or_else(|_| env::var("DATA_STUDIO_DATABASE_URL"))
             .unwrap_or_else(|_| {
-                "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+                "postgresql://postgres:postgres@localhost:5432/data_studio".to_string()
             });
         let schema_name = format!("worker_test_{}", Uuid::new_v4().simple());
         let admin_pool = sqlx::postgres::PgPoolOptions::new()
@@ -2017,14 +2017,24 @@ mod tests {
             id: Uuid::new_v4(),
             project_id,
             source_id: Some(media_asset_id),
+            parent_job_id: None,
+            batch_id: None,
             job_type: JobType::AudioValidation,
             status: JobStatus::Running,
             priority: 0,
             attempts: 0,
+            max_attempts: 3,
+            retry_count: 0,
             available_at: Utc::now(),
             lease_expires_at: None,
             worker_id: None,
+            progress_current: 0,
+            progress_total: 0,
+            result_payload: None,
             failure_reason: None,
+            failure_payload: None,
+            cancel_requested_at: None,
+            cancelled_at: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -2260,14 +2270,24 @@ mod tests {
                 id: Uuid::new_v4(),
                 project_id,
                 source_id: Some(media_asset_id),
+                parent_job_id: None,
+                batch_id: None,
                 job_type: JobType::VideoCleanup,
                 status: JobStatus::Running,
                 priority: 0,
                 attempts: 0,
+                max_attempts: 3,
+                retry_count: 0,
                 available_at: Utc::now(),
                 lease_expires_at: None,
                 worker_id: None,
+                progress_current: 0,
+                progress_total: 0,
+                result_payload: None,
                 failure_reason: None,
+                failure_payload: None,
+                cancel_requested_at: None,
+                cancelled_at: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             },

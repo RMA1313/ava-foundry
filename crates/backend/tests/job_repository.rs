@@ -13,11 +13,11 @@ async fn test_pool() -> PgPool {
     let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
         .or_else(|_| env::var("DATA_STUDIO_DATABASE_URL"))
         .unwrap_or_else(|_| {
-            "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+            "postgresql://postgres:postgres@localhost:5432/data_studio".to_string()
         });
     let schema_name = format!("job_repo_test_{}", Uuid::new_v4().simple());
     let admin_pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(5)
         .connect(&database_url)
         .await
         .expect("failed to connect to test database");
@@ -25,12 +25,13 @@ async fn test_pool() -> PgPool {
         .execute(&admin_pool)
         .await
         .expect("failed to create test schema");
+    drop(admin_pool);
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url)
         .await
         .expect("failed to run migrations");
     let pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(5)
         .connect(&schema_database_url)
         .await
         .expect("failed to connect to schema-scoped test database");
@@ -76,6 +77,10 @@ async fn repository_round_trip_works() {
     assert_eq!(created.status, JobStatus::Queued);
     assert_eq!(created.priority, 5);
     assert_eq!(created.attempts, 0);
+    assert_eq!(created.max_attempts, 3);
+    assert_eq!(created.retry_count, 0);
+    assert_eq!(created.progress_current, 0);
+    assert_eq!(created.progress_total, 0);
 
     let fetched = repository
         .get(created.id)
@@ -83,6 +88,7 @@ async fn repository_round_trip_works() {
         .expect("job lookup should succeed")
         .expect("job should exist");
     assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.max_attempts, 3);
 
     let listed = repository.list().await.expect("job list should succeed");
     assert_eq!(listed.len(), 1);

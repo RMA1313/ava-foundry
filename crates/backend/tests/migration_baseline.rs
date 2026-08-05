@@ -9,11 +9,11 @@ async fn test_pool() -> PgPool {
     let database_url = env::var("DATA_STUDIO_TEST_DATABASE_URL")
         .or_else(|_| env::var("DATA_STUDIO_DATABASE_URL"))
         .unwrap_or_else(|_| {
-            "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+            "postgresql://postgres:postgres@localhost:5432/data_studio".to_string()
         });
     let schema_name = format!("migration_baseline_test_{}", Uuid::new_v4().simple());
     let admin_pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(5)
         .connect(&database_url)
         .await
         .expect("failed to connect to test database");
@@ -21,12 +21,13 @@ async fn test_pool() -> PgPool {
         .execute(&admin_pool)
         .await
         .expect("failed to create test schema");
+    drop(admin_pool);
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url)
         .await
         .expect("failed to run migrations");
     PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(5)
         .connect(&schema_database_url)
         .await
         .expect("failed to connect to schema-scoped test database")
@@ -63,6 +64,46 @@ async fn clean_database_reaches_the_latest_schema() {
     .await
     .expect("column inspection should succeed");
     assert_eq!(media_columns, 7);
+
+    let job_columns = sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)
+        from information_schema.columns
+        where table_schema = $1
+          and table_name = 'jobs'
+          and column_name in (
+              'parent_job_id',
+              'batch_id',
+              'max_attempts',
+              'retry_count',
+              'progress_current',
+              'progress_total',
+              'result_payload',
+              'failure_payload',
+              'cancel_requested_at',
+              'cancelled_at'
+          )
+        "#,
+    )
+    .bind(&schema_name)
+    .fetch_one(&pool)
+    .await
+    .expect("job column inspection should succeed");
+    assert_eq!(job_columns, 10);
+
+    let worker_tables = sqlx::query_scalar::<_, i64>(
+        r#"
+        select count(*)
+        from information_schema.tables
+        where table_schema = $1
+          and table_name = 'worker_registry'
+        "#,
+    )
+    .bind(&schema_name)
+    .fetch_one(&pool)
+    .await
+    .expect("worker table inspection should succeed");
+    assert_eq!(worker_tables, 1);
 
     let fingerprint_tables = sqlx::query_scalar::<_, i64>(
         r#"

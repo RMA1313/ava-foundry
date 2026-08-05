@@ -19,7 +19,7 @@ async fn test_pool() -> PgPool {
     let database_url = std::env::var("DATA_STUDIO_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATA_STUDIO_DATABASE_URL"))
         .unwrap_or_else(|_| {
-            "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
+            "postgresql://postgres:postgres@localhost:5432/data_studio".to_string()
         });
     let schema_name = format!("project_api_test_{}", Uuid::new_v4().simple());
     let admin_pool = PgPoolOptions::new()
