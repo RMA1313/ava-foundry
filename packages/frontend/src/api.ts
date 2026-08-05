@@ -11,6 +11,16 @@ export type Project = {
   id: string;
   name: string;
   description?: string | null;
+  status: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type ProjectPage = {
+  items: Project[];
+  limit: number;
+  offset: number;
+  total: number;
 };
 
 export type Source = {
@@ -180,15 +190,22 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function fetchProjects(baseUrl: string): Promise<Project[]> {
-  const body = await requestJson<{ items: Project[] }>(`${baseUrl}/projects`);
-  return body.items;
+export async function fetchProjects(baseUrl: string, params?: { limit?: number; offset?: number; status?: string; search?: string; sort?: string; direction?: string }): Promise<ProjectPage> {
+  const query = new URLSearchParams();
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  if (params?.offset != null) query.set("offset", String(params.offset));
+  if (params?.status) query.set("status", params.status);
+  if (params?.search) query.set("search", params.search);
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.direction) query.set("direction", params.direction);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<ProjectPage>(`${baseUrl}/projects${suffix}`);
 }
 
-export async function createProject(baseUrl: string, name: string, description: string | null) {
+export async function createProject(baseUrl: string, name: string, description: string | null, status?: string) {
   return requestJson<Project>(`${baseUrl}/projects`, {
     method: "POST",
-    body: JSON.stringify({ name, description }),
+    body: JSON.stringify({ name, description, status }),
   });
 }
 
@@ -196,11 +213,16 @@ export async function fetchProject(baseUrl: string, projectId: string): Promise<
   return requestJson<Project>(`${baseUrl}/projects/${projectId}`);
 }
 
-export async function updateProject(baseUrl: string, projectId: string, name: string, description: string | null) {
+export async function updateProject(baseUrl: string, projectId: string, name: string, description: string | null, status?: string) {
   return requestJson<Project>(`${baseUrl}/projects/${projectId}`, {
     method: "PUT",
-    body: JSON.stringify({ name, description }),
+    body: JSON.stringify({ name, description, status }),
   });
+}
+
+export async function deleteProject(baseUrl: string, projectId: string) {
+  const response = await fetch(`${baseUrl}/projects/${projectId}`, { method: "DELETE" });
+  if (!response.ok) throw new Error(`request failed: ${response.status}`);
 }
 
 export async function fetchProjectSources(baseUrl: string, projectId: string): Promise<Source[]> {

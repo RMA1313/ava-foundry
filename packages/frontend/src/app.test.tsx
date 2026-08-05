@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { App } from "./app";
 
 type ProjectState = {
-  projects: Array<{ id: string; name: string; description: string | null }>;
+  projects: Array<{ id: string; name: string; description: string | null; status: string; created_at: string; updated_at: string }>;
   sources: Array<{ id: string; project_id: string; source_type: string; original_url: string | null; ingestion_status: string; progress: string; failure_summary: string | null; created_at: string }>;
   jobs: Array<{ id: string; project_id: string; source_id: string | null; job_type: string; status: string; attempts: number; progress: string; failure_summary: string | null; created_at: string }>;
   media: Array<{ id: string; project_id: string; source_id: string; media_kind: string; staged_path: string; original_filename: string | null; byte_size: number; ingestion_status: string; inspection_status: string | null }>;
@@ -12,7 +12,7 @@ type ProjectState = {
 };
 
 const state: ProjectState = {
-  projects: [{ id: "project-1", name: "پژوهش", description: "collection" }],
+  projects: [{ id: "project-1", name: "پژوهش", description: "collection", status: "active", created_at: "2026-08-04T00:00:00Z", updated_at: "2026-08-04T00:00:00Z" }],
   sources: [],
   jobs: [],
   media: [],
@@ -25,7 +25,8 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
   const method = init?.method ?? "GET";
 
   if (url.endsWith("/health/live")) return json({ status: "ok" });
-  if (url.endsWith("/projects")) return json({ items: state.projects });
+  if (url.includes("/projects?")) return json({ items: state.projects, limit: 8, offset: 0, total: state.projects.length });
+  if (url.endsWith("/projects")) return json({ items: state.projects, limit: 8, offset: 0, total: state.projects.length });
   if (url.endsWith("/projects/project-1")) return json(state.projects[0]);
   if (url.endsWith("/projects/project-1/sources")) return json({ items: state.sources });
   if (url.endsWith("/projects/project-1/jobs")) return json({ items: state.jobs });
@@ -33,6 +34,8 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => 
   if (url.endsWith("/projects/project-1/audio-assets")) return json({ items: state.audio });
   if (url.endsWith("/projects/project-1/duplicates")) return json({ items: state.duplicates });
   if (url.endsWith("/projects/project-1/metrics/summary")) return json({ stage_runs: [], deduplication: { throughput: null, candidate_count: 0, match_rate: 0, duplicate_ratio: 0, unique_duration_seconds: 0, processing_failures: 0 } });
+  if (url.endsWith("/projects/project-1") && method === "PUT") return json(state.projects[0]);
+  if (url.endsWith("/projects/project-1") && method === "DELETE") return new Response(null, { status: 204 });
 
   if (url.endsWith("/projects/project-1/uploads/media") && method === "POST") {
     const sourceId = `source-${state.sources.length + 1}`;
@@ -106,7 +109,8 @@ describe("App", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith("/health/live")) return json({ status: "ok" });
-      if (url.endsWith("/projects")) return json({ items: state.projects });
+      if (url.includes("/projects?")) return json({ items: state.projects, limit: 8, offset: 0, total: state.projects.length });
+      if (url.endsWith("/projects")) return json({ items: state.projects, limit: 8, offset: 0, total: state.projects.length });
       if (url.endsWith("/projects/project-1")) return json(state.projects[0]);
       if (url.endsWith("/projects/project-1/uploads/archive")) throw new Error("خطای آپلود");
       return json({});
@@ -118,6 +122,15 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("فایل"), { target: { files: [file] } });
     fireEvent.click(screen.getByRole("button", { name: "آپلود آرشیو" }));
     await waitFor(() => expect(screen.getByText("خطای آپلود")).toBeInTheDocument());
+  });
+
+  it("renders project list and detail workflows", async () => {
+    renderAt("/projects");
+    await waitFor(() => expect(screen.getByRole("heading", { name: "پروژه‌ها" })).toBeInTheDocument());
+    const detailsLink = await screen.findByRole("link", { name: "جزئیات" });
+    fireEvent.click(detailsLink);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "جزئیات پروژه" })).toBeInTheDocument());
+    expect(screen.getByLabelText("نام پروژه")).toHaveValue("پژوهش");
   });
 
   it("keeps navigation active on the current page", async () => {
@@ -182,4 +195,4 @@ describe("App", () => {
       unmount();
     }
   });
-});
+  });

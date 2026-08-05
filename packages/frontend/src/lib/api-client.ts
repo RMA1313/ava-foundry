@@ -5,7 +5,8 @@ export async function fetchLiveness(baseUrl: string): Promise<boolean> {
   return body.status === "ok";
 }
 
-export type Project = { id: string; name: string; description?: string | null };
+export type Project = { id: string; name: string; description?: string | null; status: string; created_at?: string; updated_at?: string };
+export type ProjectPage = { items: Project[]; limit: number; offset: number; total: number };
 export type Source = { id: string; project_id: string; source_type: string; original_url?: string | null; ingestion_status: string; progress: string; failure_summary?: string | null; created_at?: string; updated_at?: string };
 export type DatasetImportSummary = { imported: number; duplicate: number; invalid: number; failed: number; row_failures: Array<{ row: number; reason: string }> };
 export type Job = { id: string; project_id: string; source_id?: string | null; job_type: string; status: string; attempts: number; progress: string; failure_summary?: string | null; priority?: number; created_at?: string; updated_at?: string };
@@ -28,10 +29,31 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function fetchProjects(baseUrl: string): Promise<Project[]> { return (await requestJson<{ items: Project[] }>(`${baseUrl}/projects`)).items; }
-export async function createProject(baseUrl: string, name: string, description: string | null) { return requestJson<Project>(`${baseUrl}/projects`, { method: "POST", body: JSON.stringify({ name, description }) }); }
+export async function fetchProjects(baseUrl: string, params?: { limit?: number; offset?: number; status?: string; search?: string; sort?: string; direction?: string }): Promise<ProjectPage> {
+  const query = new URLSearchParams();
+  if (params?.limit != null) query.set("limit", String(params.limit));
+  if (params?.offset != null) query.set("offset", String(params.offset));
+  if (params?.status) query.set("status", params.status);
+  if (params?.search) query.set("search", params.search);
+  if (params?.sort) query.set("sort", params.sort);
+  if (params?.direction) query.set("direction", params.direction);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return requestJson<ProjectPage>(`${baseUrl}/projects${suffix}`);
+}
+export async function createProject(baseUrl: string, name: string, description: string | null, status?: string) { return requestJson<Project>(`${baseUrl}/projects`, { method: "POST", body: JSON.stringify({ name, description, status }) }); }
 export async function fetchProject(baseUrl: string, projectId: string): Promise<Project> { return requestJson<Project>(`${baseUrl}/projects/${projectId}`); }
-export async function updateProject(baseUrl: string, projectId: string, name: string, description: string | null) { return requestJson<Project>(`${baseUrl}/projects/${projectId}`, { method: "PUT", body: JSON.stringify({ name, description }) }); }
+export async function updateProject(baseUrl: string, projectId: string, name: string, description: string | null, status?: string) { return requestJson<Project>(`${baseUrl}/projects/${projectId}`, { method: "PUT", body: JSON.stringify({ name, description, status }) }); }
+export async function deleteProject(baseUrl: string, projectId: string) {
+  const response = await fetch(`${baseUrl}/projects/${projectId}`, { method: "DELETE" });
+  if (!response.ok) {
+    let message = `request failed: ${response.status}`;
+    try {
+      const body = (await response.json()) as { error?: { message?: string } };
+      message = body.error?.message ?? message;
+    } catch {}
+    throw new Error(message);
+  }
+}
 export async function fetchProjectSources(baseUrl: string, projectId: string): Promise<Source[]> { return (await requestJson<{ items: Source[] }>(`${baseUrl}/projects/${projectId}/sources`)).items; }
 export async function fetchProjectJobs(baseUrl: string, projectId: string): Promise<Job[]> { return (await requestJson<{ items: Job[] }>(`${baseUrl}/projects/${projectId}/jobs`)).items; }
 export async function fetchProjectMediaAssets(baseUrl: string, projectId: string): Promise<MediaAsset[]> { return (await requestJson<{ items: MediaAsset[] }>(`${baseUrl}/projects/${projectId}/media-assets`)).items; }

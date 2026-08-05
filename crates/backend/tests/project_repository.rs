@@ -61,7 +61,7 @@ async fn repository_round_trip_works() {
     assert_eq!(listed[0].id, created.id);
 
     let updated = repository
-        .update(created.id, "Updated", None)
+        .update(created.id, "Updated", None, None)
         .await
         .expect("project update should succeed")
         .expect("project should exist");
@@ -79,6 +79,57 @@ async fn repository_rejects_invalid_names() {
 
     let err = repository.create("   ", None).await.unwrap_err();
     assert!(err.to_string().contains("project name cannot be empty"));
+}
+
+#[tokio::test]
+async fn repository_rejects_duplicate_names_case_insensitively() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let repository = ProjectRepository::new(pool);
+
+    repository
+        .create("Research", None)
+        .await
+        .expect("first project should be created");
+    let err = repository.create("research", None).await.unwrap_err();
+    assert!(err.to_string().contains("duplicate"));
+}
+
+#[tokio::test]
+async fn repository_deletes_project_content_transactionally() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let repository = ProjectRepository::new(pool.clone());
+    let project = repository.create("Research", None).await.expect("project");
+    let source_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    sqlx::query("insert into sources (id, project_id, source_type, normalized_identity, ingestion_status, created_at, updated_at) values ($1, $2, 'local_file', 'file:///tmp/a', 'pending', now(), now())")
+        .bind(source_id)
+        .bind(project.id)
+        .execute(&pool)
+        .await
+        .expect("source");
+    sqlx::query("insert into jobs (id, project_id, source_id, job_type, status, priority, attempts, available_at, created_at, updated_at) values ($1, $2, $3, 'media_ingestion', 'queued', 1, 0, now(), now(), now())")
+        .bind(job_id)
+        .bind(project.id)
+        .bind(source_id)
+        .execute(&pool)
+        .await
+        .expect("job");
+
+    assert!(repository.delete(project.id).await.expect("delete"));
+    let remaining_sources = sqlx::query_scalar::<_, i64>("select count(*) from sources where project_id = $1")
+        .bind(project.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count sources");
+    let remaining_jobs = sqlx::query_scalar::<_, i64>("select count(*) from jobs where project_id = $1")
+        .bind(project.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count jobs");
+    assert_eq!(remaining_sources, 0);
+    assert_eq!(remaining_jobs, 0);
 }
 
 #[tokio::test]

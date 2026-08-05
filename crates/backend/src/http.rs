@@ -17,6 +17,7 @@ use crate::{
     ingestion,
     job::{JobListFilter, JobStatus, JobType},
     media_asset::{MediaAsset, MediaAssetListFilter},
+    project::{ProjectListFilter, ProjectListSort, ProjectSortField, ProjectStatus, SortDirection},
     server::AppState,
     source::{SourceListFilter, SourceType},
     stage_run::StageRun,
@@ -31,18 +32,24 @@ struct StatusResponse {
 struct ProjectListQuery {
     limit: Option<u32>,
     offset: Option<u32>,
+    status: Option<String>,
+    search: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ProjectCreateRequest {
     name: String,
     description: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ProjectUpdateRequest {
     name: String,
     description: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +115,7 @@ struct ProjectResponse {
     id: String,
     name: String,
     description: Option<String>,
+    status: String,
     created_at: String,
     updated_at: String,
 }
@@ -117,6 +125,7 @@ struct ProjectsResponse {
     items: Vec<ProjectResponse>,
     limit: u32,
     offset: u32,
+    total: i64,
 }
 
 #[derive(Serialize)]
@@ -376,7 +385,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", get(ready))
         .route("/staging/capacity", get(staging_capacity))
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/:id", get(get_project).put(update_project))
+        .route("/projects/:id", get(get_project).put(update_project).delete(delete_project))
         .route("/projects/:id/sources", get(list_sources))
         .route("/projects/:id/jobs", get(list_jobs))
         .route("/projects/:id/media-assets", get(list_media_assets))
@@ -472,12 +481,33 @@ async fn create_project(
     Json(payload): Json<ProjectCreateRequest>,
 ) -> Result<(StatusCode, Json<ProjectResponse>), (StatusCode, Json<ErrorResponse>)> {
     let repository = state.database.projects();
+    let status = match payload.status {
+        Some(value) => Some(ProjectStatus::parse(&value).map_err(|err| {
+            error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+        })?),
+        None => Some(ProjectStatus::Active),
+    };
     let project = repository
         .create(payload.name.as_str(), payload.description.as_deref())
         .await
         .map_err(|err| {
             error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
         })?;
+    let project = match status {
+        Some(status) if status != ProjectStatus::Active => repository
+            .update(
+                project.id,
+                &project.name,
+                project.description.as_deref(),
+                Some(status),
+            )
+            .await
+            .map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?
+            .unwrap_or(project),
+        _ => project,
+    };
     Ok((StatusCode::CREATED, Json(project.into())))
 }
 
@@ -511,8 +541,31 @@ async fn list_projects(
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let offset = query.offset.unwrap_or(0);
     let repository = state.database.projects();
-    let items = repository
-        .list_paginated(limit as i64, offset as i64)
+    let filter = ProjectListFilter {
+        status: match query.status.as_deref() {
+            Some(value) => Some(ProjectStatus::parse(value).map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?),
+            None => None,
+        },
+        search: query.search.clone(),
+    };
+    let sort = match query.sort.as_deref() {
+        Some(value) => Some(ProjectListSort {
+            field: ProjectSortField::parse(value).map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?,
+            direction: match query.direction.as_deref() {
+                Some(value) => SortDirection::parse(value).map_err(|err| {
+                    error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+                })?,
+                None => SortDirection::Asc,
+            },
+        }),
+        None => None,
+    };
+    let page = repository
+        .list_paginated(Some(filter), sort, limit as i64, offset as i64)
         .await
         .map_err(|err| {
             error_response(
@@ -522,9 +575,10 @@ async fn list_projects(
             )
         })?;
     Ok(Json(ProjectsResponse {
-        items: items.into_iter().map(Into::into).collect(),
+        items: page.items.into_iter().map(Into::into).collect(),
         limit,
         offset,
+        total: page.total,
     }))
 }
 
@@ -536,7 +590,17 @@ async fn update_project(
     let id = parse_uuid(&id)?;
     let repository = state.database.projects();
     let project = repository
-        .update(id, payload.name.as_str(), payload.description.as_deref())
+        .update(
+            id,
+            payload.name.as_str(),
+            payload.description.as_deref(),
+            match payload.status {
+                Some(value) => Some(ProjectStatus::parse(&value).map_err(|err| {
+                    error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+                })?),
+                None => None,
+            },
+        )
         .await
         .map_err(|err| {
             error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
@@ -548,6 +612,28 @@ async fn update_project(
             "project_not_found",
             "project not found",
         )),
+    }
+}
+
+async fn delete_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let id = parse_uuid(&id)?;
+    let deleted = state
+        .database
+        .projects()
+        .delete(id)
+        .await
+        .map_err(database_error)?;
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(error_response(
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+            "project not found",
+        ))
     }
 }
 
@@ -1292,6 +1378,7 @@ impl From<crate::project::Project> for ProjectResponse {
             id: value.id.to_string(),
             name: value.name,
             description: value.description,
+            status: value.status.as_str().to_string(),
             created_at: value.created_at.to_rfc3339(),
             updated_at: value.updated_at.to_rfc3339(),
         }

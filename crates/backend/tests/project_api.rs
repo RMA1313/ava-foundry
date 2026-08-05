@@ -126,6 +126,37 @@ async fn project_lifecycle_works_through_http() {
 }
 
 #[tokio::test]
+async fn project_listing_supports_pagination_search_filter_and_sorting() {
+    let app = router().await;
+
+    for (name, status) in [("Alpha", "active"), ("Beta", "archived"), ("Gamma", "active")] {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::post("/projects")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"name":"{name}","description":null,"status":"{status}"}}"#)))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/projects?limit=1&offset=0&search=Al&status=active&sort=name&direction=desc").body(Body::empty()).expect("request should build"))
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+    let listed: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(listed["limit"], 1);
+    assert_eq!(listed["offset"], 0);
+    assert_eq!(listed["total"], 1);
+    assert_eq!(listed["items"].as_array().expect("items").len(), 1);
+}
+
+#[tokio::test]
 async fn invalid_project_requests_return_deterministic_errors() {
     let app = router().await;
 
@@ -151,4 +182,16 @@ async fn invalid_project_requests_return_deterministic_errors() {
         .await
         .expect("request should succeed");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/projects")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"Bad status","description":null,"status":"broken"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

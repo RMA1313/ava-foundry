@@ -2,6 +2,7 @@ import { createContext, ReactNode, useContext, useEffect, useMemo, useState } fr
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   createProject,
+  deleteProject,
   fetchAudioAsset,
   fetchLiveness,
   fetchProject,
@@ -129,7 +130,7 @@ function WorkspaceShell({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void fetchLiveness(baseUrl).then((ok) => setStatus(ok ? "ready" : "offline"));
-    void fetchProjects(baseUrl).then(setProjects);
+    void fetchProjects(baseUrl, { limit: 100 }).then((page) => setProjects(page.items ?? []));
   }, [refreshTick]);
 
   const selectedProjectId = params.projectId ?? projects[0]?.id ?? "";
@@ -213,30 +214,88 @@ function WorkspacePage({ title, subtitle, children, actions, loading, error, emp
 }
 
 function ProjectsLanding() {
-  const { data, loading, error } = usePolling(() => fetchProjects(baseUrl), [], 10000);
-  const projects = data ?? [];
+  const [searchParams, setSearchParams] = useSearchParams();
+  const page = Number(searchParams.get("page") ?? "1");
+  const sort = searchParams.get("sort") ?? "created_at";
+  const direction = searchParams.get("direction") ?? "asc";
+  const status = searchParams.get("status") ?? "";
+  const q = searchParams.get("q") ?? "";
+  const { data, loading, error, refresh } = usePolling(
+    () => fetchProjects(baseUrl, { limit: pageSize, offset: (page - 1) * pageSize, status: status || undefined, search: q || undefined, sort, direction }),
+    [page, sort, direction, status, q],
+    10000,
+  );
+  const pageData = {
+    items: data?.items ?? [],
+    limit: data?.limit ?? pageSize,
+    offset: data?.offset ?? 0,
+    total: data?.total ?? 0,
+  };
+  const update = (patch: Record<string, string>) => {
+    const next = new URLSearchParams(searchParams);
+    for (const [key, value] of Object.entries(patch)) {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    }
+    next.set("page", "1");
+    setSearchParams(next, { replace: true });
+  };
   return (
-    <WorkspacePage title="پروژه‌ها" subtitle="یک پروژه را انتخاب کنید یا پروژه جدید بسازید." loading={loading} error={error} empty={projects.length === 0}>
+    <WorkspacePage
+      title="پروژه‌ها"
+      subtitle="فهرست، جستجو، فیلتر، sort و pagination روی backend واقعی."
+      loading={loading}
+      error={error}
+      empty={pageData.items.length === 0}
+      actions={
+        <div style={appStyles.toolbar}>
+          <button type="button" style={appStyles.buttonSecondary} onClick={() => void refresh()}>
+            بازنشانی
+          </button>
+          <NavLink to="/projects/new" style={appStyles.button}>
+            پروژه تازه
+          </NavLink>
+        </div>
+      }
+    >
       <div style={appStyles.toolbar}>
-        <NavLink to="/projects/new" style={appStyles.button}>
-          پروژه تازه
-        </NavLink>
+        <input aria-label="جستجوی پروژه" value={q} onChange={(e) => update({ q: e.target.value })} placeholder="جستجو بر اساس نام..." style={{ ...appStyles.input, maxWidth: 280 }} />
+        <select aria-label="فیلتر وضعیت" value={status} onChange={(e) => update({ status: e.target.value })} style={appStyles.input}>
+          <option value="">همه وضعیت‌ها</option>
+          <option value="active">active</option>
+          <option value="archived">archived</option>
+        </select>
+        <select aria-label="مرتب‌سازی" value={sort} onChange={(e) => update({ sort: e.target.value })} style={appStyles.input}>
+          <option value="created_at">created_at</option>
+          <option value="updated_at">updated_at</option>
+          <option value="name">name</option>
+        </select>
+        <select aria-label="جهت مرتب‌سازی" value={direction} onChange={(e) => update({ direction: e.target.value })} style={appStyles.input}>
+          <option value="asc">asc</option>
+          <option value="desc">desc</option>
+        </select>
       </div>
       <div style={appStyles.list}>
-        {projects.map((project) => (
+        {pageData.items.map((project) => (
           <div key={project.id} style={appStyles.row}>
             <div style={appStyles.compactRow}>
               <div>
                 <div style={appStyles.value}>{project.name}</div>
+                <div style={appStyles.sectionText}>{project.status}</div>
                 {project.description ? <div style={appStyles.muted}>{project.description}</div> : null}
               </div>
-              <NavLink to={`/projects/${project.id}/dashboard`} style={appStyles.buttonSecondary}>
-                باز کردن داشبورد
+              <NavLink to={`/projects/${project.id}`} style={appStyles.buttonSecondary}>
+                جزئیات
               </NavLink>
             </div>
           </div>
         ))}
       </div>
+      <Pager page={page - 1} setPage={(nextPage) => {
+        const next = new URLSearchParams(searchParams);
+        next.set("page", String(nextPage + 1));
+        setSearchParams(next, { replace: true });
+      }} total={pageData.total} />
     </WorkspacePage>
   );
 }
@@ -245,6 +304,7 @@ function ProjectCreatePage() {
   const navigate = useNavigate();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [status, setStatus] = useState("active");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -262,8 +322,8 @@ function ProjectCreatePage() {
           setSaving(true);
           setError("");
           try {
-            const project = await createProject(baseUrl, trimmedName, description.trim() || null);
-            navigate(`/projects/${project.id}/dashboard`);
+            const project = await createProject(baseUrl, trimmedName, description.trim() || null, status);
+            navigate(`/projects/${project.id}`);
           } catch (err) {
             setError(defaultError(err));
           } finally {
@@ -273,10 +333,118 @@ function ProjectCreatePage() {
       >
         <input aria-label="نام پروژه" value={name} onChange={(e) => setName(e.target.value)} style={appStyles.input} />
         <textarea aria-label="توضیح" value={description} onChange={(e) => setDescription(e.target.value)} style={{ ...appStyles.input, minHeight: 120, resize: "vertical" }} />
+        <select aria-label="وضعیت پروژه" value={status} onChange={(e) => setStatus(e.target.value)} style={appStyles.input}>
+          <option value="active">active</option>
+          <option value="archived">archived</option>
+        </select>
         <button type="submit" style={appStyles.button} disabled={saving}>
           {saving ? "در حال ساخت..." : "ساخت پروژه"}
         </button>
       </form>
+    </WorkspacePage>
+  );
+}
+
+function ProjectDetailPage() {
+  const navigate = useNavigate();
+  const { projectId = "" } = useParams();
+  const { data: project, loading, error, refresh } = usePolling(() => fetchProject(baseUrl, projectId), [projectId], 5000);
+  const { data: sources } = usePolling(() => fetchProjectSources(baseUrl, projectId), [projectId], 5000);
+  const { data: jobs } = usePolling(() => fetchProjectJobs(baseUrl, projectId), [projectId], 5000);
+  const { data: media } = usePolling(() => fetchProjectMediaAssets(baseUrl, projectId), [projectId], 5000);
+  const { data: audio } = usePolling(() => fetchProjectAudioAssets(baseUrl, projectId), [projectId], 5000);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [status, setStatus] = useState("active");
+  const [saving, setSaving] = useState(false);
+  const [actionError, setActionError] = useState("");
+
+  useEffect(() => {
+    if (project) {
+      setName(project.name);
+      setDescription(project.description ?? "");
+      setStatus(project.status);
+    }
+  }, [project]);
+
+  const stats = [
+    ["منابع", sources?.length ?? 0],
+    ["jobها", jobs?.length ?? 0],
+    ["رسانه", media?.length ?? 0],
+    ["صوت", audio?.length ?? 0],
+  ] as const;
+
+  return (
+    <WorkspacePage
+      title="جزئیات پروژه"
+      subtitle="نمایش، ویرایش و حذف پروژه."
+      loading={loading}
+      error={error || actionError}
+      actions={
+        <div style={appStyles.toolbar}>
+          <NavLink to={`/projects/${projectId}/dashboard`} style={appStyles.buttonSecondary}>
+            داشبورد
+          </NavLink>
+          <button
+            type="button"
+            style={appStyles.buttonSecondary}
+            onClick={async () => {
+              if (!window.confirm("این پروژه حذف شود؟")) return;
+              try {
+                await deleteProject(baseUrl, projectId);
+                navigate("/projects");
+              } catch (err) {
+                setActionError(defaultError(err));
+              }
+            }}
+          >
+            حذف پروژه
+          </button>
+        </div>
+      }
+    >
+      {project ? (
+        <>
+          <div style={appStyles.row}>
+            <div style={appStyles.value}>{project.name}</div>
+            <div style={appStyles.sectionText}>{project.status}</div>
+            {project.description ? <div style={appStyles.muted}>{project.description}</div> : null}
+          </div>
+          <div style={appStyles.summaryGrid}>
+            {stats.map(([label, value]) => <SummaryItem key={label} label={label} value={value} />)}
+          </div>
+          <form
+            style={appStyles.form}
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!name.trim()) {
+                setActionError("نام پروژه الزامی است.");
+                return;
+              }
+              setSaving(true);
+              setActionError("");
+              try {
+                await updateProject(baseUrl, projectId, name.trim(), description.trim() || null, status);
+                await refresh();
+              } catch (err) {
+                setActionError(defaultError(err));
+              } finally {
+                setSaving(false);
+              }
+            }}
+          >
+            <input aria-label="نام پروژه" value={name} onChange={(e) => setName(e.target.value)} style={appStyles.input} />
+            <textarea aria-label="توضیح پروژه" value={description} onChange={(e) => setDescription(e.target.value)} style={{ ...appStyles.input, minHeight: 120, resize: "vertical" }} />
+            <select aria-label="وضعیت پروژه" value={status} onChange={(e) => setStatus(e.target.value)} style={appStyles.input}>
+              <option value="active">active</option>
+              <option value="archived">archived</option>
+            </select>
+            <button type="submit" style={appStyles.button} disabled={saving}>
+              {saving ? "در حال ذخیره..." : "ذخیره تغییرات"}
+            </button>
+          </form>
+        </>
+      ) : null}
     </WorkspacePage>
   );
 }
@@ -916,7 +1084,7 @@ export function App() {
         <Route path="/" element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<WorkspaceShell><ProjectsLanding /></WorkspaceShell>} />
         <Route path="/projects/new" element={<WorkspaceShell><ProjectCreatePage /></WorkspaceShell>} />
-        <Route path="/projects/:projectId" element={<WorkspaceShell><Navigate to="dashboard" replace /></WorkspaceShell>} />
+        <Route path="/projects/:projectId" element={<WorkspaceShell><ProjectDetailPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/dashboard" element={<WorkspaceShell><DashboardPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/sources" element={<WorkspaceShell><SourcesPage /></WorkspaceShell>} />
         <Route path="/projects/:projectId/url-import" element={<WorkspaceShell><UrlImportPage /></WorkspaceShell>} />
