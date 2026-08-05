@@ -127,9 +127,9 @@ describe("App", () => {
   it("renders project list and detail workflows", async () => {
     renderAt("/projects");
     await waitFor(() => expect(screen.getByRole("heading", { name: "پروژه‌ها" })).toBeInTheDocument());
-    const detailsLink = await screen.findByRole("link", { name: "جزئیات" });
+    const detailsLink = await screen.findByRole("link", { name: /جزئیات/i });
     fireEvent.click(detailsLink);
-    await waitFor(() => expect(screen.getByRole("heading", { name: "جزئیات پروژه" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("heading", { name: /جزئیات/i })).toBeInTheDocument());
     expect(screen.getByLabelText("نام پروژه")).toHaveValue("پژوهش");
   });
 

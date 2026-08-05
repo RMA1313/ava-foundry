@@ -137,10 +137,6 @@ function WorkspaceShell({ children }: { children: ReactNode }) {
   const project = projects.find((item) => item.id === selectedProjectId);
   const projectNavBase = selectedProjectId ? `/projects/${selectedProjectId}` : "/projects";
 
-  useEffect(() => {
-    if (!params.projectId && projects[0]?.id) navigate(`/projects/${projects[0].id}/dashboard`, { replace: true });
-  }, [navigate, params.projectId, projects]);
-
   return (
     <ProjectRefreshContext.Provider value={refreshTick}>
     <ProjectRefreshActionContext.Provider value={() => setRefreshTick((value) => value + 1)}>
