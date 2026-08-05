@@ -15,7 +15,7 @@ use backend::{
     },
 };
 use chrono::Utc;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{env, fs, path::Path, sync::Arc};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -28,7 +28,9 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("ingestion_worker_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url)
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
         .await
         .expect("failed to connect to test database");
     sqlx::query(&format!("create schema {}", schema_name))
@@ -39,7 +41,9 @@ async fn test_pool() -> PgPool {
     migrations::run(&schema_database_url)
         .await
         .expect("failed to run migrations");
-    PgPool::connect(&schema_database_url)
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&schema_database_url)
         .await
         .expect("failed to connect to schema-scoped test database")
 }
@@ -96,6 +100,7 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
             project_id,
             SourceType::PublicUrl,
             Some("https://youtu.be/abcd1234"),
+            None,
             None,
         )
         .await
@@ -160,7 +165,7 @@ async fn worker_runtime_processes_media_ingestion_and_completes_job() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(source.ingestion_status, "completed");
+    assert_eq!(source.ingestion_status.as_str(), "completed");
     let asset = database_for_runtime
         .media_assets()
         .get_by_source(source.id)
@@ -224,6 +229,7 @@ async fn repeated_finalization_does_not_duplicate_media_assets() {
             project_id,
             SourceType::PublicUrl,
             Some("https://youtu.be/abcd1234"),
+            None,
             None,
         )
         .await
@@ -292,6 +298,7 @@ async fn transaction_rolls_back_when_finalization_job_is_missing() {
             SourceType::PublicUrl,
             Some("https://youtu.be/abcd1234"),
             None,
+            None,
         )
         .await
         .expect("source should be created");
@@ -313,7 +320,7 @@ async fn transaction_rolls_back_when_finalization_job_is_missing() {
     assert!(err.to_string().contains("job not found"));
 
     let source = database.sources().get(source.id).await.unwrap().unwrap();
-    assert_eq!(source.ingestion_status, "pending");
+    assert_eq!(source.ingestion_status.as_str(), "pending");
     assert!(database
         .media_assets()
         .get_by_source(source.id)

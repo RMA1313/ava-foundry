@@ -351,6 +351,7 @@ impl WorkerRuntime {
             tokio::select! {
                 _ = &mut shutdown => {
                     stop_flag.store(true, Ordering::SeqCst);
+                    break;
                 }
                 _ = tokio::time::sleep(self.poll_interval), if !stop_flag.load(Ordering::SeqCst) => {
                     self.claim_and_spawn(state.clone(), &mut join_set, semaphore.clone()).await?;
@@ -984,18 +985,23 @@ mod tests {
                 "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
             });
         let schema_name = format!("worker_test_{}", Uuid::new_v4().simple());
-        let admin_pool = PgPool::connect(&database_url)
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
             .await
             .expect("failed to connect to test database");
         sqlx::query(&format!("create schema {}", schema_name))
             .execute(&admin_pool)
             .await
             .expect("failed to create test schema");
+        drop(admin_pool);
         let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
         migrations::run(&schema_database_url)
             .await
             .expect("failed to run migrations");
-        PgPool::connect(&schema_database_url)
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&schema_database_url)
             .await
             .expect("failed to connect to schema-scoped test database")
     }
@@ -1030,6 +1036,7 @@ mod tests {
 
     async fn seed_project(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
+        let name = format!("Research {}", id.simple());
         sqlx::query(
             r#"
             insert into projects (id, name, description, created_at, updated_at)
@@ -1037,7 +1044,7 @@ mod tests {
             "#,
         )
         .bind(id)
-        .bind("Research")
+        .bind(name)
         .bind(Option::<String>::None)
         .execute(pool)
         .await

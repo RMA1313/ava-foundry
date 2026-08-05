@@ -5,7 +5,7 @@ use backend::{
     db::Database, migrations, server::AppState, storage::AudioStorageConfig,
     worker::DefaultFilesystemMetrics, worker::StagingCapacityGuard,
 };
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{env, path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -17,14 +17,23 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("metrics_api_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url).await.unwrap();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
     sqlx::query(&format!("create schema {}", schema_name))
         .execute(&admin_pool)
         .await
         .unwrap();
+    drop(admin_pool);
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url).await.unwrap();
-    PgPool::connect(&schema_database_url).await.unwrap()
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_database_url)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]

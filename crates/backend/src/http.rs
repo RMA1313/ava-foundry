@@ -1,12 +1,14 @@
 use axum::{
     extract::{multipart::Multipart, Path, Query, State},
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use sqlx::Row;
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Instant;
 use tracing::{info_span, Instrument};
 use uuid::Uuid;
@@ -19,7 +21,7 @@ use crate::{
     media_asset::{MediaAsset, MediaAssetListFilter},
     project::{ProjectListFilter, ProjectListSort, ProjectSortField, ProjectStatus, SortDirection},
     server::AppState,
-    source::{SourceListFilter, SourceType},
+    source::{SourceListFilter, SourceListSort, SourceSortField, SourceType},
     stage_run::StageRun,
 };
 
@@ -78,6 +80,19 @@ struct SourceListQuery {
     offset: Option<u32>,
     source_type: Option<String>,
     ingestion_status: Option<String>,
+    search: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SourceUpdateRequest {
+    source_config: Option<String>,
+    import_metadata: Option<String>,
+    ingestion_status: Option<String>,
+    failure_reason: Option<String>,
+    file_count: Option<i64>,
+    byte_count: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -141,8 +156,19 @@ struct ErrorDetail {
 
 #[derive(Serialize)]
 struct UploadResponse {
-    path: String,
+    items: Vec<UploadItemResponse>,
+    total_files: u32,
+    total_byte_size: u64,
+}
+
+#[derive(Serialize)]
+struct UploadItemResponse {
+    source_id: String,
+    job_id: String,
+    original_filename: String,
+    stored_path: String,
     byte_size: u64,
+    sha256: String,
 }
 
 #[derive(Serialize)]
@@ -157,6 +183,11 @@ struct SourceResponse {
     project_id: String,
     source_type: String,
     original_url: Option<String>,
+    source_config: Option<String>,
+    failure_reason: Option<String>,
+    import_metadata: Option<String>,
+    file_count: i64,
+    byte_count: i64,
     ingestion_status: String,
     progress: String,
     failure_summary: Option<String>,
@@ -385,8 +416,20 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", get(ready))
         .route("/staging/capacity", get(staging_capacity))
         .route("/projects", get(list_projects).post(create_project))
-        .route("/projects/:id", get(get_project).put(update_project).delete(delete_project))
+        .route(
+            "/projects/:id",
+            get(get_project).put(update_project).delete(delete_project),
+        )
         .route("/projects/:id/sources", get(list_sources))
+        .route(
+            "/projects/:id/sources/:source_id",
+            get(get_source).put(update_source).delete(delete_source),
+        )
+        .route("/projects/:id/sources/:source_id/retry", post(retry_source))
+        .route(
+            "/projects/:id/sources/:source_id/cancel",
+            post(cancel_source),
+        )
         .route("/projects/:id/jobs", get(list_jobs))
         .route("/projects/:id/media-assets", get(list_media_assets))
         .route("/projects/:id/audio-assets", get(list_audio_assets))
@@ -434,7 +477,11 @@ async fn request_logging_layer(
         stage_id = tracing::field::Empty,
     );
     async move {
-        let response = next.run(req).await;
+        let mut response = next.run(req).await;
+        response.headers_mut().insert(
+            "x-request-id",
+            HeaderValue::from_str(&request_id.to_string()).unwrap(),
+        );
         tracing::info!(
             request_id = %request_id,
             method = %method,
@@ -491,7 +538,17 @@ async fn create_project(
         .create(payload.name.as_str(), payload.description.as_deref())
         .await
         .map_err(|err| {
-            error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            let status = if err.to_string() == "project name already exists" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let code = if status == StatusCode::CONFLICT {
+                "conflict"
+            } else {
+                "invalid_request"
+            };
+            error_response(status, code, err.to_string())
         })?;
     let project = match status {
         Some(status) if status != ProjectStatus::Active => repository
@@ -603,7 +660,17 @@ async fn update_project(
         )
         .await
         .map_err(|err| {
-            error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            let status = if err.to_string() == "project name already exists" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let code = if status == StatusCode::CONFLICT {
+                "conflict"
+            } else {
+                "invalid_request"
+            };
+            error_response(status, code, err.to_string())
         })?;
     match project {
         Some(project) => Ok(Json(project.into())),
@@ -683,6 +750,15 @@ async fn list_sources(
         Some(value) => Some(parse_source_type(value)?),
         None => None,
     };
+    let sort = match query.sort.as_deref() {
+        Some(value) => Some(SourceListSort {
+            field: SourceSortField::parse(value).map_err(|err| {
+                error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
+            })?,
+            descending: matches!(query.direction.as_deref(), Some("desc")),
+        }),
+        None => None,
+    };
     let page = state
         .database
         .sources()
@@ -691,7 +767,9 @@ async fn list_sources(
             Some(SourceListFilter {
                 source_type,
                 ingestion_status: query.ingestion_status.clone(),
+                search: query.search.clone(),
             }),
+            sort,
             query.limit.unwrap_or(50) as i64,
             query.offset.unwrap_or(0) as i64,
         )
@@ -702,6 +780,192 @@ async fn list_sources(
         limit: page.limit,
         offset: page.offset,
     }))
+}
+
+async fn get_source(
+    State(state): State<AppState>,
+    Path((project_id, source_id)): Path<(String, String)>,
+) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let source_id = parse_uuid(&source_id)?;
+    let source = state
+        .database
+        .sources()
+        .get_in_project(project_id, source_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "source_not_found",
+                "source not found",
+            )
+        })?;
+    Ok(Json(source_response(source)))
+}
+
+async fn update_source(
+    State(state): State<AppState>,
+    Path((project_id, source_id)): Path<(String, String)>,
+    Json(payload): Json<SourceUpdateRequest>,
+) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let source_id = parse_uuid(&source_id)?;
+    let mut source = state
+        .database
+        .sources()
+        .get_in_project(project_id, source_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "source_not_found",
+                "source not found",
+            )
+        })?;
+    if let Some(value) = payload.source_config.as_deref() {
+        source = state
+            .database
+            .sources()
+            .update_source_config(source_id, Some(value))
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "source not found",
+                )
+            })?;
+    }
+    if let Some(value) = payload.import_metadata.as_deref() {
+        source = state
+            .database
+            .sources()
+            .update_import_metadata(source_id, Some(value))
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "source not found",
+                )
+            })?;
+    }
+    if let Some(value) = payload.failure_reason.as_deref() {
+        source = state
+            .database
+            .sources()
+            .update_failure_state(source_id, Some(value))
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "source not found",
+                )
+            })?;
+    }
+    if let Some(value) = payload.ingestion_status.as_deref() {
+        source = state
+            .database
+            .sources()
+            .update_ingestion_status(source_id, value)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "source not found",
+                )
+            })?;
+    }
+    if let (Some(file_count), Some(byte_count)) = (payload.file_count, payload.byte_count) {
+        source = state
+            .database
+            .sources()
+            .update_counters(source_id, file_count, byte_count)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "source_not_found",
+                    "source not found",
+                )
+            })?;
+    }
+    Ok(Json(source_response(source)))
+}
+
+async fn delete_source(
+    State(state): State<AppState>,
+    Path((project_id, source_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let source_id = parse_uuid(&source_id)?;
+    let deleted = state
+        .database
+        .sources()
+        .delete(project_id, source_id)
+        .await
+        .map_err(database_error)?;
+    if !deleted {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "source_not_found",
+            "source not found",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn retry_source(
+    State(state): State<AppState>,
+    Path((project_id, source_id)): Path<(String, String)>,
+) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let source_id = parse_uuid(&source_id)?;
+    let source = state
+        .database
+        .sources()
+        .retry(project_id, source_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "source_not_found",
+                "source not found",
+            )
+        })?;
+    Ok(Json(source_response(source)))
+}
+
+async fn cancel_source(
+    State(state): State<AppState>,
+    Path((project_id, source_id)): Path<(String, String)>,
+) -> Result<Json<SourceResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project_id = parse_uuid(&project_id)?;
+    let source_id = parse_uuid(&source_id)?;
+    let source = state
+        .database
+        .sources()
+        .cancel(project_id, source_id)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "source_not_found",
+                "source not found",
+            )
+        })?;
+    Ok(Json(source_response(source)))
 }
 
 async fn list_jobs(
@@ -1149,7 +1413,7 @@ async fn scan_folder(
     Json(payload): Json<FolderScanRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let project_id = parse_uuid(&id)?;
-    let (discovered, created, skipped) = ingestion::scan_folder(
+    let summary = ingestion::scan_folder(
         &state.database,
         project_id,
         std::path::Path::new(&payload.path),
@@ -1157,9 +1421,12 @@ async fn scan_folder(
     .await
     .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?;
     Ok(Json(serde_json::json!({
-        "discovered": discovered,
-        "created": created,
-        "skipped": skipped,
+        "source_id": summary.source_id.to_string(),
+        "discovered": summary.discovered,
+        "created": summary.created,
+        "changed": summary.changed,
+        "removed": summary.removed,
+        "skipped": summary.skipped,
     })))
 }
 
@@ -1195,37 +1462,268 @@ async fn upload_file(
     kind: &str,
 ) -> Result<Json<UploadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let project_id = parse_uuid(&id)?;
-    let mut file_path: Option<PathBuf> = None;
+    let mut uploads = Vec::new();
+    let mut file_count = 0u32;
     while let Some(field) = multipart.next_field().await.map_err(|err| {
         error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
     })? {
         if field.name().unwrap_or_default() == "file" {
+            file_count += 1;
+            if file_count > 20 {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "too many uploaded files",
+                ));
+            }
             let filename = field.file_name().unwrap_or(kind).to_string();
-            let path = persist_upload(&state, project_id, filename, field)
+            let upload = persist_upload(&state, project_id, &filename, field, kind)
                 .await
                 .map_err(|err| {
                     error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
                 })?;
-            file_path = Some(path);
+            uploads.push(upload);
         }
     }
-    let file_path = file_path.ok_or_else(|| {
-        error_response(
+    if uploads.is_empty() {
+        return Err(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "missing file upload",
-        )
-    })?;
-    let byte_size = std::fs::metadata(&file_path)
-        .map_err(|err| error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string()))?
-        .len();
+        ));
+    }
+    let total_byte_size = uploads.iter().map(|upload| upload.byte_size).sum();
     Ok(Json(UploadResponse {
-        path: file_path.display().to_string(),
-        byte_size,
+        total_files: uploads.len() as u32,
+        total_byte_size,
+        items: uploads
+            .into_iter()
+            .map(|upload| UploadItemResponse {
+                source_id: upload.source_id.to_string(),
+                job_id: upload.job_id.to_string(),
+                original_filename: upload.original_filename,
+                stored_path: upload.stored_path.display().to_string(),
+                byte_size: upload.byte_size,
+                sha256: upload.sha256,
+            })
+            .collect(),
     }))
 }
 
+struct PersistedUpload {
+    source_id: Uuid,
+    job_id: Uuid,
+    original_filename: String,
+    stored_path: PathBuf,
+    byte_size: u64,
+    sha256: String,
+}
+
+struct UploadConstraints {
+    max_bytes: u64,
+}
+
+fn upload_constraints(kind: &str) -> UploadConstraints {
+    let max_bytes = match kind {
+        "archive" => 2_147_483_648,
+        _ => 1_073_741_824,
+    };
+    UploadConstraints { max_bytes }
+}
+
+fn validate_upload_filename<'a>(filename: &'a str, kind: &str) -> anyhow::Result<&'a str> {
+    let path = FsPath::new(filename);
+    let basename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid filename"))?;
+    if basename != filename
+        || basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.starts_with('.')
+    {
+        return Err(anyhow::anyhow!("unsafe filename"));
+    }
+    let allowed: &[&str] = match kind {
+        "media" => &[
+            "wav", "mp3", "flac", "ogg", "m4a", "mp4", "mkv", "webm", "mov", "avi",
+        ],
+        "archive" => &["zip", "tar", "gz", "tgz"],
+        _ => return Err(anyhow::anyhow!("unsupported upload kind")),
+    };
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    if !extension
+        .as_deref()
+        .is_some_and(|ext| allowed.contains(&ext))
+    {
+        return Err(anyhow::anyhow!("invalid file extension"));
+    }
+    Ok(basename)
+}
+
+fn validate_upload_mime(
+    content_type: Option<&str>,
+    filename: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let extension = FsPath::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let ok = match kind {
+        "media" => matches!(
+            (content_type.unwrap_or_default(), extension.as_str()),
+            ("audio/wav", "wav")
+                | ("audio/x-wav", "wav")
+                | ("audio/mpeg", "mp3")
+                | ("audio/flac", "flac")
+                | ("audio/ogg", "ogg")
+                | ("audio/mp4", "m4a")
+                | ("video/mp4", "mp4")
+                | ("video/x-matroska", "mkv")
+                | ("video/webm", "webm")
+                | ("video/quicktime", "mov")
+                | ("video/x-msvideo", "avi")
+        ),
+        "archive" => matches!(
+            (content_type.unwrap_or_default(), extension.as_str()),
+            ("application/zip", "zip")
+                | ("application/x-tar", "tar")
+                | ("application/gzip", "gz")
+                | ("application/x-gtar-compressed", "tgz")
+                | ("application/x-tgz", "tgz")
+        ),
+        _ => false,
+    };
+    if !ok {
+        return Err(anyhow::anyhow!("mime type does not match file extension"));
+    }
+    Ok(())
+}
+
 async fn persist_upload(
+    state: &AppState,
+    project_id: Uuid,
+    filename: &str,
+    mut field: axum::extract::multipart::Field<'_>,
+    kind: &str,
+) -> anyhow::Result<PersistedUpload> {
+    let original_filename = validate_upload_filename(filename, kind)?.to_string();
+    validate_upload_mime(field.content_type(), &original_filename, kind)?;
+    let constraints = upload_constraints(kind);
+    let upload_dir = state
+        .staging_dir
+        .join("uploads")
+        .join(project_id.to_string());
+    tokio::fs::create_dir_all(&upload_dir).await?;
+    let upload_id = Uuid::new_v4();
+    let temp_path = upload_dir.join(format!("{upload_id}.part"));
+    let stored_path = upload_dir.join(format!("{upload_id}-{original_filename}"));
+    let mut file = tokio::fs::File::create(&temp_path).await?;
+    let mut hasher = Sha256::new();
+    let mut byte_size = 0u64;
+    while let Some(chunk) = field.chunk().await? {
+        byte_size = byte_size
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("uploaded file is too large"))?;
+        if byte_size > constraints.max_bytes {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(anyhow::anyhow!("uploaded file exceeds size limit"));
+        }
+        hasher.update(&chunk);
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    tokio::fs::rename(&temp_path, &stored_path).await?;
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    let source_id = Uuid::new_v4();
+    let job_id = Uuid::new_v4();
+    let upload_metadata = format!(
+        r#"{{"upload_kind":"{}","sha256":"{}","original_filename":"{}","stored_path":"{}"}}"#,
+        kind,
+        sha256,
+        original_filename,
+        stored_path.display()
+    );
+    let mut tx = state.database.pool().begin().await?;
+    let source_row = sqlx::query(
+        r#"
+        insert into sources (
+            id, project_id, source_type, original_url, normalized_identity,
+            source_config, failure_reason, import_metadata, file_count, byte_count,
+            ingestion_status, created_at, updated_at
+        )
+        values ($1, $2, 'local_file', $3, $4, $5, null, $6, 1, $7, 'pending', now(), now())
+        on conflict (project_id, normalized_identity)
+        do update set updated_at = excluded.updated_at
+        returning id
+        "#,
+    )
+    .bind(source_id)
+    .bind(project_id)
+    .bind(stored_path.to_string_lossy().to_string())
+    .bind(format!(
+        "local_file:{}",
+        stored_path.to_string_lossy().to_lowercase()
+    ))
+    .bind(Some(upload_metadata.clone()))
+    .bind(Some(upload_metadata))
+    .bind(byte_size as i64)
+    .fetch_one(&mut *tx)
+    .await;
+    let source_id = match source_row {
+        Ok(row) => row.try_get::<Uuid, _>("id")?,
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&stored_path).await;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(err.into());
+        }
+    };
+    if let Err(err) = sqlx::query(
+        r#"
+        insert into jobs (
+            id, project_id, source_id, job_type, status,
+            priority, attempts, available_at, lease_expires_at,
+            worker_id, failure_reason, created_at, updated_at
+        )
+        values ($1, $2, $3, 'media_ingestion', 'queued',
+                0, 0, now(), null, null, null, now(), now())
+        on conflict (project_id, source_id, job_type)
+        do update set updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(job_id)
+    .bind(project_id)
+    .bind(source_id)
+    .execute(&mut *tx)
+    .await
+    {
+        let _ = tokio::fs::remove_file(&stored_path).await;
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(err.into());
+    }
+    if let Err(err) = tx.commit().await {
+        let _ = tokio::fs::remove_file(&stored_path).await;
+        return Err(err.into());
+    }
+
+    Ok(PersistedUpload {
+        source_id,
+        job_id,
+        original_filename,
+        stored_path,
+        byte_size,
+        sha256,
+    })
+}
+
+async fn persist_staged_upload(
     state: &AppState,
     project_id: Uuid,
     filename: String,
@@ -1276,7 +1774,7 @@ async fn import_dataset(
             "file" => {
                 let filename = field.file_name().unwrap_or("dataset");
                 let filename = filename.to_string();
-                let path = persist_upload(&state, project_id, filename, field)
+                let path = persist_staged_upload(&state, project_id, filename, field)
                     .await
                     .map_err(|err| {
                         error_response(StatusCode::BAD_REQUEST, "invalid_request", err.to_string())
@@ -1454,15 +1952,20 @@ fn parse_job_status(value: &str) -> Result<JobStatus, (StatusCode, Json<ErrorRes
 }
 
 fn source_response(source: crate::source::Source) -> SourceResponse {
-    let progress = source.ingestion_status.clone();
+    let progress = source.ingestion_status.as_str().to_string();
     SourceResponse {
         id: source.id.to_string(),
         project_id: source.project_id.to_string(),
         source_type: source_type_name(source.source_type).to_string(),
         original_url: source.original_url,
+        source_config: source.source_config,
+        failure_reason: source.failure_reason.clone(),
+        import_metadata: source.import_metadata.clone(),
+        file_count: source.file_count,
+        byte_count: source.byte_count,
         ingestion_status: progress.clone(),
         progress,
-        failure_summary: bounded_summary(source.import_metadata.as_deref()),
+        failure_summary: bounded_summary(source.failure_reason.as_deref()),
         created_at: source.created_at.to_rfc3339(),
         updated_at: source.updated_at.to_rfc3339(),
     }

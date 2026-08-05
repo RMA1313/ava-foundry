@@ -2,7 +2,7 @@ mod support;
 
 use backend::media_asset::MediaAssetUpsert;
 use backend::{media_asset::MediaAssetRepository, migrations};
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
 use uuid::Uuid;
 
@@ -13,18 +13,23 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("media_asset_repo_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url)
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
         .await
         .expect("failed to connect to test database");
     sqlx::query(&format!("create schema {}", schema_name))
         .execute(&admin_pool)
         .await
         .expect("failed to create test schema");
+    drop(admin_pool);
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url)
         .await
         .expect("failed to run migrations");
-    let pool = PgPool::connect(&schema_database_url)
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_database_url)
         .await
         .expect("failed to connect to schema-scoped test database");
     sqlx::query("truncate table media_assets, sources, projects restart identity cascade")

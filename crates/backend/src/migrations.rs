@@ -4,13 +4,35 @@ use sqlx::migrate::Migrator;
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 pub async fn run(database_url: &str) -> Result<()> {
-    // Keep this module changing when migrations change so SQLx re-embeds the set.
-    // Phase 3 adds fingerprint persistence in a later migration.
-    let _ = database_url;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect(database_url)
         .await?;
     MIGRATOR.run(&pool).await?;
+    sqlx::query(
+        r#"
+        alter table if exists projects
+            add column if not exists status text not null default 'active'
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        update projects
+        set status = 'active'
+        where status is null
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        r#"
+        create unique index if not exists projects_name_unique_idx
+            on projects (lower(name))
+        "#,
+    )
+    .execute(&pool)
+    .await?;
     sqlx::query(
         r#"
         alter table if exists media_assets

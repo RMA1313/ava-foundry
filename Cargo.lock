@@ -361,6 +361,7 @@ dependencies = [
  "predicates",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tar",
  "tempfile",

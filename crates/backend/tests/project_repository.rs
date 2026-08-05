@@ -1,7 +1,7 @@
 mod support;
 
 use backend::{migrations, project::ProjectRepository};
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
 use uuid::Uuid;
 
@@ -12,7 +12,9 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("project_repo_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url)
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
         .await
         .expect("failed to connect to test database");
     sqlx::query(&format!("create schema {}", schema_name))
@@ -23,7 +25,9 @@ async fn test_pool() -> PgPool {
     migrations::run(&schema_database_url)
         .await
         .expect("failed to run migrations");
-    let pool = PgPool::connect(&schema_database_url)
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_database_url)
         .await
         .expect("failed to connect to schema-scoped test database");
     sqlx::query("truncate table projects restart identity cascade")
@@ -92,7 +96,36 @@ async fn repository_rejects_duplicate_names_case_insensitively() {
         .await
         .expect("first project should be created");
     let err = repository.create("research", None).await.unwrap_err();
-    assert!(err.to_string().contains("duplicate"));
+    assert_eq!(err.to_string(), "project name already exists");
+}
+
+#[tokio::test]
+async fn repository_rejects_duplicate_names_on_update_case_insensitively() {
+    support::clear_env();
+    let pool = test_pool().await;
+    let repository = ProjectRepository::new(pool);
+
+    let first = repository
+        .create("Research", None)
+        .await
+        .expect("first project should be created");
+    let second = repository
+        .create("Catalog", None)
+        .await
+        .expect("second project should be created");
+
+    let err = repository
+        .update(second.id, "research", None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "project name already exists");
+
+    let fetched = repository
+        .get(first.id)
+        .await
+        .expect("lookup should succeed")
+        .expect("first project should still exist");
+    assert_eq!(fetched.name, "Research");
 }
 
 #[tokio::test]
@@ -118,16 +151,18 @@ async fn repository_deletes_project_content_transactionally() {
         .expect("job");
 
     assert!(repository.delete(project.id).await.expect("delete"));
-    let remaining_sources = sqlx::query_scalar::<_, i64>("select count(*) from sources where project_id = $1")
-        .bind(project.id)
-        .fetch_one(&pool)
-        .await
-        .expect("count sources");
-    let remaining_jobs = sqlx::query_scalar::<_, i64>("select count(*) from jobs where project_id = $1")
-        .bind(project.id)
-        .fetch_one(&pool)
-        .await
-        .expect("count jobs");
+    let remaining_sources =
+        sqlx::query_scalar::<_, i64>("select count(*) from sources where project_id = $1")
+            .bind(project.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count sources");
+    let remaining_jobs =
+        sqlx::query_scalar::<_, i64>("select count(*) from jobs where project_id = $1")
+            .bind(project.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count jobs");
     assert_eq!(remaining_sources, 0);
     assert_eq!(remaining_jobs, 0);
 }

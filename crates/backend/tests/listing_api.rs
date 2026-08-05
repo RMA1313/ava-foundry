@@ -9,7 +9,7 @@ use backend::{
     source::SourceType, storage::AudioStorageConfig,
 };
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{env, path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -21,14 +21,22 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("listing_api_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url).await.unwrap();
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .unwrap();
     sqlx::query(&format!("create schema {}", schema_name))
         .execute(&admin_pool)
         .await
         .unwrap();
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url).await.unwrap();
-    PgPool::connect(&schema_database_url).await.unwrap()
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_database_url)
+        .await
+        .unwrap()
 }
 
 async fn seed_project(pool: &PgPool, name: &str) -> Uuid {
@@ -62,6 +70,7 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
             SourceType::PublicUrl,
             Some("https://youtu.be/aaaa1111"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -71,6 +80,7 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
             project_id,
             SourceType::LocalFile,
             Some("/tmp/audio.wav"),
+            None,
             None,
         )
         .await
@@ -91,6 +101,7 @@ async fn sources_and_jobs_can_be_listed_with_filters_and_pagination() {
             other_project_id,
             SourceType::PublicUrl,
             Some("https://youtu.be/zzzz9999"),
+            None,
             None,
         )
         .await
@@ -444,6 +455,7 @@ async fn media_assets_can_be_listed_with_filters_and_project_isolation() {
             SourceType::PublicUrl,
             Some("https://youtu.be/aaaa1111"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -453,6 +465,7 @@ async fn media_assets_can_be_listed_with_filters_and_project_isolation() {
             other_project_id,
             SourceType::PublicUrl,
             Some("https://youtu.be/zzzz9999"),
+            None,
             None,
         )
         .await
@@ -573,6 +586,7 @@ async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
             SourceType::PublicUrl,
             Some("https://youtu.be/abcd1234"),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -609,6 +623,7 @@ async fn retry_endpoint_requeues_failed_jobs_and_is_project_scoped() {
             other_project_id,
             SourceType::PublicUrl,
             Some("https://youtu.be/zzzz9999"),
+            None,
             None,
         )
         .await

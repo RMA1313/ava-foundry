@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    io::{BufRead, BufReader, Read},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -13,6 +14,9 @@ use walkdir::WalkDir;
 use zip::read::ZipArchive;
 
 use crate::{db::Database, job::JobType, source::SourceType};
+
+const MAX_ARCHIVE_FILES: usize = 10_000;
+const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationResult {
@@ -33,6 +37,34 @@ pub struct CsvImportSummary {
 pub struct RowFailure {
     pub row: u32,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderScanSummary {
+    pub discovered: u32,
+    pub created: u32,
+    pub changed: u32,
+    pub removed: u32,
+    pub skipped: u32,
+    pub source_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FolderScanConfig {
+    root: PathBuf,
+    recursive: bool,
+    include_patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
+    include_hidden: bool,
+    follow_symlinks: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedFile {
+    path: PathBuf,
+    size: u64,
+    modified_secs: i64,
+    is_symlink: bool,
 }
 
 pub async fn register_local_file(
@@ -67,6 +99,7 @@ pub async fn register_local_file(
             project_id,
             SourceType::LocalFile,
             Some(path.to_string_lossy().as_ref()),
+            None,
             None,
         )
         .await?;
@@ -151,7 +184,7 @@ pub async fn register_public_url(
     }
     let source = database
         .sources()
-        .create(project_id, SourceType::PublicUrl, Some(url), None)
+        .create(project_id, SourceType::PublicUrl, Some(url), None, None)
         .await?;
     let job = database
         .jobs()
@@ -173,43 +206,322 @@ pub async fn scan_folder(
     database: &Database,
     project_id: uuid::Uuid,
     root: &Path,
-) -> Result<(u32, u32, u32)> {
-    let root = root.canonicalize().context("folder must exist")?;
+) -> Result<FolderScanSummary> {
+    let root = validate_folder_root(root)?;
+    let config = load_folder_scan_config(&root)?;
+    let folder_source = ensure_folder_source(database, project_id, &config).await?;
+    let existing_files = existing_folder_files(database, project_id, &config.root).await?;
+    let mut seen = BTreeSet::new();
     let mut discovered = 0;
     let mut created = 0;
+    let mut changed = 0;
     let mut skipped = 0;
-    for entry in WalkDir::new(&root).follow_links(false) {
+    for tracked in walk_folder(&config)? {
+        discovered += 1;
+        let normalized_identity = local_file_identity(&tracked.path);
+        seen.insert(normalized_identity.clone());
+        match database
+            .sources()
+            .get_by_identity(project_id, &normalized_identity)
+            .await?
+        {
+            Some(existing) => {
+                if tracked_file_from_source(&existing) == Some(tracked.clone()) {
+                    skipped += 1;
+                    continue;
+                }
+                let source_config = tracked_file_config(&config, &tracked)?;
+                let _ = database
+                    .sources()
+                    .update_source_config(existing.id, Some(&source_config))
+                    .await?;
+                let _ = database
+                    .sources()
+                    .update_counters(existing.id, tracked.size as i64, tracked.size as i64)
+                    .await?;
+                let _ = ensure_media_ingestion_job(database, project_id, existing.id).await?;
+                changed += 1;
+            }
+            None => {
+                let source_config = tracked_file_config(&config, &tracked)?;
+                let source = database
+                    .sources()
+                    .create(
+                        project_id,
+                        SourceType::LocalFile,
+                        Some(tracked.path.to_string_lossy().as_ref()),
+                        Some(&source_config),
+                        None,
+                    )
+                    .await?;
+                let _ = database
+                    .sources()
+                    .update_counters(source.id, tracked.size as i64, tracked.size as i64)
+                    .await?;
+                let _ = ensure_media_ingestion_job(database, project_id, source.id).await?;
+                created += 1;
+            }
+        }
+    }
+    let removed = existing_files
+        .into_iter()
+        .filter(|source| !seen.contains(&source.normalized_identity))
+        .count() as u32;
+    let summary = FolderScanSummary {
+        discovered,
+        created,
+        changed,
+        removed,
+        skipped,
+        source_id: folder_source.id,
+    };
+    let _ = database
+        .sources()
+        .update_import_metadata(
+            folder_source.id,
+            Some(&serde_json::to_string(&serde_json::json!({
+                "source_id": summary.source_id.to_string(),
+                "discovered": summary.discovered,
+                "created": summary.created,
+                "changed": summary.changed,
+                "removed": summary.removed,
+                "skipped": summary.skipped,
+            }))?),
+        )
+        .await?;
+    Ok(summary)
+}
+
+fn validate_folder_root(root: &Path) -> Result<PathBuf> {
+    let root = root.canonicalize().context("folder must exist")?;
+    let approved_roots = approved_roots()?;
+    if approved_roots
+        .iter()
+        .any(|approved| root.starts_with(approved))
+    {
+        Ok(root)
+    } else {
+        Err(anyhow!("path is outside approved roots"))
+    }
+}
+
+fn approved_roots() -> Result<Vec<PathBuf>> {
+    let roots = std::env::var("DATA_STUDIO_FOLDER_SCAN_ROOTS")
+        .ok()
+        .or_else(|| std::env::var("DATA_STUDIO_DATA_DIR").ok())
+        .or_else(|| std::env::var("DATA_STUDIO_WORKSPACE_DIR").ok())
+        .unwrap_or_else(|| ".".to_string());
+    roots
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            PathBuf::from(value)
+                .canonicalize()
+                .with_context(|| format!("approved root must exist: {value}"))
+        })
+        .collect()
+}
+
+fn load_folder_scan_config(root: &Path) -> Result<FolderScanConfig> {
+    Ok(FolderScanConfig {
+        root: root.to_path_buf(),
+        recursive: true,
+        include_patterns: parse_pattern_list("DATA_STUDIO_FOLDER_SCAN_INCLUDE"),
+        exclude_patterns: parse_pattern_list("DATA_STUDIO_FOLDER_SCAN_EXCLUDE"),
+        include_hidden: false,
+        follow_symlinks: false,
+    })
+}
+
+async fn ensure_folder_source(
+    database: &Database,
+    project_id: uuid::Uuid,
+    config: &FolderScanConfig,
+) -> Result<crate::source::Source> {
+    let identity = format!(
+        "local_folder:{}",
+        config.root.to_string_lossy().trim().to_lowercase()
+    );
+    if let Some(source) = database
+        .sources()
+        .get_by_identity(project_id, &identity)
+        .await?
+    {
+        return Ok(source);
+    }
+    database
+        .sources()
+        .create(
+            project_id,
+            SourceType::LocalFolder,
+            Some(config.root.to_string_lossy().as_ref()),
+            Some(&serde_json::to_string(config)?),
+            None,
+        )
+        .await
+}
+
+async fn ensure_media_ingestion_job(
+    database: &Database,
+    project_id: uuid::Uuid,
+    source_id: uuid::Uuid,
+) -> Result<uuid::Uuid> {
+    let job = database
+        .jobs()
+        .create(
+            project_id,
+            Some(source_id),
+            JobType::MediaIngestion,
+            0,
+            Utc::now(),
+        )
+        .await?;
+    Ok(job.id)
+}
+
+fn local_file_identity(path: &Path) -> String {
+    format!(
+        "local_file:{}",
+        path.to_string_lossy().trim().to_lowercase()
+    )
+}
+
+fn tracked_file_config(config: &FolderScanConfig, tracked: &TrackedFile) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "scan_root": config.root,
+        "path": tracked.path,
+        "size": tracked.size,
+        "modified_secs": tracked.modified_secs,
+        "is_symlink": tracked.is_symlink,
+    }))?)
+}
+
+fn tracked_file_from_source(source: &crate::source::Source) -> Option<TrackedFile> {
+    let value: serde_json::Value = serde_json::from_str(source.source_config.as_ref()?).ok()?;
+    Some(TrackedFile {
+        path: PathBuf::from(value.get("path")?.as_str()?),
+        size: value.get("size")?.as_u64()?,
+        modified_secs: value.get("modified_secs")?.as_i64()?,
+        is_symlink: value.get("is_symlink")?.as_bool()?,
+    })
+}
+
+async fn existing_folder_files(
+    database: &Database,
+    project_id: uuid::Uuid,
+    root: &Path,
+) -> Result<Vec<crate::source::Source>> {
+    let sources = database.sources().list(project_id).await?;
+    Ok(sources
+        .into_iter()
+        .filter(|source| source.source_type == SourceType::LocalFile)
+        .filter(|source| {
+            source
+                .source_config
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .and_then(|value| {
+                    value
+                        .get("scan_root")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from)
+                })
+                .map(|scan_root| scan_root == root)
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
+fn walk_folder(config: &FolderScanConfig) -> Result<Vec<TrackedFile>> {
+    let mut results = Vec::new();
+    let mut walker = WalkDir::new(&config.root).follow_links(config.follow_symlinks);
+    if !config.recursive {
+        walker = walker.max_depth(1);
+    }
+    for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
         }
-        let path = entry.path();
-        if !path.starts_with(&root) {
-            skipped += 1;
+        let path = entry.path().to_path_buf();
+        if !path.starts_with(&config.root) {
             continue;
         }
-        if !is_supported_media(path) {
-            skipped += 1;
+        let relative = path.strip_prefix(&config.root).unwrap_or(&path);
+        if !config.include_hidden && is_hidden(relative) {
             continue;
         }
-        discovered += 1;
-        let normalized_identity = format!(
-            "local_file:{}",
-            path.to_string_lossy().trim().to_lowercase()
-        );
-        let existed = database
-            .sources()
-            .get_by_identity(project_id, &normalized_identity)
-            .await?
-            .is_some();
-        let _ = register_local_file(database, project_id, path).await?;
-        if existed {
-            skipped += 1;
-        } else {
-            created += 1;
+        if !matches_patterns(relative, &config.include_patterns, &config.exclude_patterns) {
+            continue;
         }
+        if !is_supported_media(&path) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        let modified_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or_default();
+        results.push(TrackedFile {
+            path,
+            size: metadata.len(),
+            modified_secs,
+            is_symlink: metadata.file_type().is_symlink(),
+        });
     }
-    Ok((discovered, created, skipped))
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(results)
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        Component::Normal(part) => part.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
+fn parse_pattern_list(env_key: &str) -> Vec<String> {
+    std::env::var(env_key)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn matches_patterns(path: &Path, includes: &[String], excludes: &[String]) -> bool {
+    let relative = path.to_string_lossy();
+    let included = includes.is_empty()
+        || includes
+            .iter()
+            .any(|pattern| pattern_match(pattern, &relative));
+    let excluded = excludes
+        .iter()
+        .any(|pattern| pattern_match(pattern, &relative));
+    included && !excluded
+}
+
+fn pattern_match(pattern: &str, value: &str) -> bool {
+    wildcard_match(pattern.as_bytes(), value.as_bytes())
+}
+
+fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+    if pattern.is_empty() {
+        return value.is_empty();
+    }
+    match pattern[0] {
+        b'*' => (0..=value.len()).any(|index| wildcard_match(&pattern[1..], &value[index..])),
+        b'?' => !value.is_empty() && wildcard_match(&pattern[1..], &value[1..]),
+        ch => !value.is_empty() && ch == value[0] && wildcard_match(&pattern[1..], &value[1..]),
+    }
 }
 
 pub async fn import_csv_urls(
@@ -458,30 +770,60 @@ async fn register_manifest_path(
     if !audio_path.exists() {
         return Ok(None);
     }
-    let source = database
+    let normalized_identity = format!(
+        "existing_dataset:{}",
+        audio_path.to_string_lossy().to_lowercase()
+    );
+    let source = match database
         .sources()
-        .create(
-            project_id,
-            SourceType::ExistingDataset,
-            Some(audio_path.to_string_lossy().as_ref()),
-            Some(&metadata.to_string()),
-        )
-        .await?;
-    let job = database
+        .get_by_identity(project_id, &normalized_identity)
+        .await?
+    {
+        Some(existing) => existing,
+        None => {
+            database
+                .sources()
+                .create(
+                    project_id,
+                    SourceType::ExistingDataset,
+                    Some(audio_path.to_string_lossy().as_ref()),
+                    None,
+                    Some(&metadata.to_string()),
+                )
+                .await?
+        }
+    };
+    let job = match database
         .jobs()
-        .create(
-            project_id,
-            Some(source.id),
-            JobType::MediaIngestion,
-            0,
-            Utc::now(),
-        )
-        .await?;
+        .get_by_logical_key(project_id, Some(source.id), JobType::MediaIngestion)
+        .await?
+    {
+        Some(existing) => existing,
+        None => {
+            database
+                .jobs()
+                .create(
+                    project_id,
+                    Some(source.id),
+                    JobType::MediaIngestion,
+                    0,
+                    Utc::now(),
+                )
+                .await?
+        }
+    };
     Ok(Some(DatasetItemResult {
         source_id: source.id,
         job_id: job.id,
         metadata,
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    Zip,
+    Tar,
+    TarGz,
 }
 
 pub async fn extract_archive(archive_path: &Path, output_dir: &Path) -> Result<PathBuf> {
@@ -492,43 +834,77 @@ pub async fn extract_archive(archive_path: &Path, output_dir: &Path) -> Result<P
         .unwrap_or("archive");
     let extract_dir = output_dir.join(format!("extract-{}", archive_name));
     fs::create_dir_all(&extract_dir)?;
-    match archive_path
-        .extension()
-        .and_then(|v| v.to_str())
-        .map(|v| v.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("zip") => {
+    let result = match detect_archive_format(archive_path)? {
+        ArchiveFormat::Zip => {
             let file = fs::File::open(archive_path)?;
             let mut archive = ZipArchive::new(file)?;
-            extract_zip(&mut archive, &extract_dir)?;
+            extract_zip(&mut archive, &extract_dir)
         }
-        Some("tar") => {
+        ArchiveFormat::Tar => {
             let file = fs::File::open(archive_path)?;
             let mut archive = tar::Archive::new(file);
-            extract_tar(&mut archive, &extract_dir)?;
+            extract_tar(&mut archive, &extract_dir)
         }
-        Some("gz") | Some("tgz") => {
+        ArchiveFormat::TarGz => {
             let file = fs::File::open(archive_path)?;
             let decoder = GzDecoder::new(file);
             let mut archive = tar::Archive::new(decoder);
-            extract_tar(&mut archive, &extract_dir)?;
+            extract_tar(&mut archive, &extract_dir)
         }
-        _ => return Err(anyhow!("unsupported archive format")),
+    };
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&extract_dir);
     }
+    result?;
     Ok(extract_dir)
+}
+
+fn detect_archive_format(archive_path: &Path) -> Result<ArchiveFormat> {
+    let mut file = fs::File::open(archive_path)?;
+    let mut magic = [0u8; 4];
+    let read = file.read(&mut magic)?;
+    let ext = archive_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase());
+    if read >= 4 && magic == [0x50, 0x4b, 0x03, 0x04] {
+        return Ok(ArchiveFormat::Zip);
+    }
+    if read >= 2 && magic.starts_with(&[0x1f, 0x8b]) {
+        return Ok(ArchiveFormat::TarGz);
+    }
+    match ext.as_deref() {
+        Some("tar") => Ok(ArchiveFormat::Tar),
+        Some("tgz") => Ok(ArchiveFormat::TarGz),
+        _ => Err(anyhow!("unsupported archive format")),
+    }
 }
 
 fn extract_zip<R: std::io::Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     output_dir: &Path,
 ) -> Result<()> {
+    let mut file_count = 0usize;
+    let mut total_size = 0u64;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
+        if file.encrypted() {
+            return Err(anyhow!("encrypted archives are not supported"));
+        }
         let out = safe_join(output_dir, file.name())?;
         if file.is_dir() {
             fs::create_dir_all(&out)?;
             continue;
+        }
+        file_count += 1;
+        if file_count > MAX_ARCHIVE_FILES {
+            return Err(anyhow!("archive exceeds file count limit"));
+        }
+        total_size = total_size
+            .checked_add(file.size())
+            .ok_or_else(|| anyhow!("archive exceeds size limit"))?;
+        if total_size > MAX_ARCHIVE_BYTES {
+            return Err(anyhow!("archive exceeds size limit"));
         }
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
@@ -540,10 +916,30 @@ fn extract_zip<R: std::io::Read + std::io::Seek>(
 }
 
 fn extract_tar<R: std::io::Read>(archive: &mut tar::Archive<R>, output_dir: &Path) -> Result<()> {
+    let mut file_count = 0usize;
+    let mut total_size = 0u64;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
         let out = safe_join(output_dir, path.to_string_lossy().as_ref())?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            fs::create_dir_all(&out)?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(anyhow!("unsupported archive entry"));
+        }
+        file_count += 1;
+        if file_count > MAX_ARCHIVE_FILES {
+            return Err(anyhow!("archive exceeds file count limit"));
+        }
+        total_size = total_size
+            .checked_add(entry.header().size()?)
+            .ok_or_else(|| anyhow!("archive exceeds size limit"))?;
+        if total_size > MAX_ARCHIVE_BYTES {
+            return Err(anyhow!("archive exceeds size limit"));
+        }
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -658,9 +1054,19 @@ mod tests {
         file::{properties::WriterProperties, writer::SerializedFileWriter},
         schema::parser::parse_message_type,
     };
+    use std::sync::OnceLock;
     use std::{env, fs, fs::File, io::Write, path::PathBuf, sync::Arc};
     use uuid::Uuid;
     use zip::read::ZipArchive;
+
+    static DB_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn lock_db_tests() -> tokio::sync::MutexGuard<'static, ()> {
+        DB_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
 
     fn clear_env() {
         for key in [
@@ -688,18 +1094,23 @@ mod tests {
                 "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
             });
         let schema_name = format!("ingestion_manifest_test_{}", Uuid::new_v4().simple());
-        let admin_pool = sqlx::PgPool::connect(&database_url)
+        let admin_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
             .await
             .expect("failed to connect to test database");
         sqlx::query(&format!("create schema {}", schema_name))
             .execute(&admin_pool)
             .await
             .expect("failed to create test schema");
+        drop(admin_pool);
         let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
         migrations::run(&schema_database_url)
             .await
             .expect("failed to run migrations");
-        sqlx::PgPool::connect(&schema_database_url)
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&schema_database_url)
             .await
             .expect("failed to connect to schema-scoped test database")
     }
@@ -871,8 +1282,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn folder_scan_rejects_paths_outside_approved_roots() {
+        clear_env();
+        let temp_dir = temp_dir();
+        std::env::set_var(
+            "DATA_STUDIO_FOLDER_SCAN_ROOTS",
+            temp_dir.to_string_lossy().to_string(),
+        );
+        let outside = std::env::temp_dir().join(format!("outside_{}", Uuid::new_v4()));
+        fs::create_dir_all(&outside).expect("outside dir");
+        let err = validate_folder_root(&outside).unwrap_err();
+        assert!(err.to_string().contains("approved roots"));
+    }
+
+    #[tokio::test]
+    async fn folder_scan_is_recursive_idempotent_and_persists_summary() {
+        clear_env();
+        let pool = test_pool().await;
+        let project_id = seed_project(&pool).await;
+        let database = Database::from_pool(pool.clone());
+        let temp_dir = temp_dir();
+        std::env::set_var(
+            "DATA_STUDIO_FOLDER_SCAN_ROOTS",
+            temp_dir.to_string_lossy().to_string(),
+        );
+        std::env::set_var("DATA_STUDIO_FOLDER_SCAN_EXCLUDE", "*/skip.wav");
+        let nested = temp_dir.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(temp_dir.join("keep.wav"), b"keep").expect("keep");
+        fs::write(nested.join("child.mp3"), b"child").expect("child");
+        fs::write(nested.join("skip.wav"), b"skip").expect("skip");
+
+        let summary = scan_folder(&database, project_id, &temp_dir)
+            .await
+            .expect("scan");
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.created, 2);
+        assert_eq!(summary.changed, 0);
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.skipped, 0);
+
+        let repeated = scan_folder(&database, project_id, &temp_dir)
+            .await
+            .expect("repeat scan");
+        assert_eq!(repeated.created, 0);
+        assert_eq!(repeated.changed, 0);
+        assert_eq!(repeated.discovered, 2);
+
+        let sources = database.sources().list(project_id).await.expect("sources");
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| source.source_type == SourceType::LocalFile)
+                .count(),
+            2
+        );
+        assert!(sources
+            .iter()
+            .any(|source| source.source_type == SourceType::LocalFolder));
+        let jobs = database.jobs().list().await.expect("jobs");
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[tokio::test]
     async fn archive_import_cleans_up_and_reuses_existing_sources() {
         clear_env();
+        let _guard = lock_db_tests().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -931,6 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn archive_import_supports_tar_and_tgz() {
         clear_env();
+        let _guard = lock_db_tests().await;
         let pool = test_pool().await;
         let project_id = seed_project(&pool).await;
         let database = Database::from_pool(pool.clone());
@@ -1021,5 +1497,37 @@ mod tests {
         let mut archive = ZipArchive::new(file).expect("archive");
         let err = extract_zip(&mut archive, &temp_dir).unwrap_err();
         assert!(err.to_string().contains("path traversal"));
+    }
+
+    #[tokio::test]
+    async fn archive_import_rejects_corrupt_and_unsupported_files_without_leaking_temp_dirs() {
+        clear_env();
+        let temp_dir = temp_dir();
+        let workspace = temp_dir.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let bad = temp_dir.join("bad.bin");
+        fs::write(&bad, b"not an archive").expect("bad file");
+        let err = extract_archive(&bad, &workspace).await.unwrap_err();
+        assert!(err.to_string().contains("unsupported archive format"));
+    }
+
+    #[tokio::test]
+    async fn archive_import_rejects_archive_bombs_by_file_count() {
+        clear_env();
+        let temp_dir = temp_dir();
+        let archive_path = temp_dir.join("bomb.zip");
+        {
+            let file = File::create(&archive_path).expect("zip file");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..(MAX_ARCHIVE_FILES + 1) {
+                zip.start_file(format!("file-{i}.txt"), options)
+                    .expect("file");
+                zip.write_all(b"x").expect("write");
+            }
+            zip.finish().expect("finish");
+        }
+        let err = extract_archive(&archive_path, &temp_dir).await.unwrap_err();
+        assert!(err.to_string().contains("file count limit"));
     }
 }

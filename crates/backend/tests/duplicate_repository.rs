@@ -6,7 +6,7 @@ use backend::{
     migrations,
 };
 use chrono::Utc;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::env;
 use uuid::Uuid;
 
@@ -17,16 +17,23 @@ async fn test_pool() -> PgPool {
             "postgresql://postgres:postgres@localhost:55432/data_studio".to_string()
         });
     let schema_name = format!("duplicate_repo_test_{}", Uuid::new_v4().simple());
-    let admin_pool = PgPool::connect(&database_url).await.expect("connect");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect");
     sqlx::query(&format!("create schema {}", schema_name))
         .execute(&admin_pool)
         .await
         .expect("create schema");
+    drop(admin_pool);
     let schema_database_url = format!("{database_url}?options=-csearch_path%3D{schema_name}");
     migrations::run(&schema_database_url)
         .await
         .expect("migrations");
-    PgPool::connect(&schema_database_url)
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_database_url)
         .await
         .expect("connect schema pool")
 }

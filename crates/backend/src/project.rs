@@ -99,7 +99,10 @@ pub struct ProjectListSort {
 
 impl Default for ProjectListSort {
     fn default() -> Self {
-        Self { field: ProjectSortField::CreatedAt, direction: SortDirection::Asc }
+        Self {
+            field: ProjectSortField::CreatedAt,
+            direction: SortDirection::Asc,
+        }
     }
 }
 
@@ -117,7 +120,9 @@ pub struct ProjectRepository {
 }
 
 impl ProjectRepository {
-    pub fn new(pool: PgPool) -> Self { Self { pool } }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
 
     pub async fn create(&self, name: &str, description: Option<&str>) -> Result<Project> {
         let mut tx = self.pool.begin().await?;
@@ -148,7 +153,8 @@ impl ProjectRepository {
         .bind(description.as_deref())
         .bind(now)
         .fetch_one(&mut **tx)
-        .await?;
+        .await
+        .map_err(map_project_unique_violation)?;
         project_from_row(&row)
     }
 
@@ -162,12 +168,15 @@ impl ProjectRepository {
         )
         .bind(id)
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(map_project_unique_violation)?;
         row.as_ref().map(project_from_row).transpose()
     }
 
     pub async fn list(&self) -> Result<Vec<Project>> {
-        self.list_paginated(None, None, 100, 0).await.map(|page| page.items)
+        self.list_paginated(None, None, 100, 0)
+            .await
+            .map(|page| page.items)
     }
 
     pub async fn list_paginated(
@@ -179,11 +188,22 @@ impl ProjectRepository {
     ) -> Result<ProjectPage> {
         let limit = limit.clamp(1, 100);
         let offset = offset.max(0);
-        let filter = filter.unwrap_or(ProjectListFilter { status: None, search: None });
+        let filter = filter.unwrap_or(ProjectListFilter {
+            status: None,
+            search: None,
+        });
         let sort = sort.unwrap_or_default();
-        let search = filter.search.as_deref().map(|value| format!("%{}%", value.trim()));
+        let search = filter
+            .search
+            .as_deref()
+            .map(|value| format!("%{}%", value.trim()));
         let status = filter.status.map(|s| s.as_str());
-        let order_by = format!("{} {}, id {}", sort.field.as_sql(), sort.direction.as_sql(), sort.direction.as_sql());
+        let order_by = format!(
+            "{} {}, id {}",
+            sort.field.as_sql(),
+            sort.direction.as_sql(),
+            sort.direction.as_sql()
+        );
 
         let total = sqlx::query_scalar::<_, i64>(
             r#"
@@ -208,8 +228,16 @@ impl ProjectRepository {
             .bind(offset)
             .fetch_all(&self.pool)
             .await?;
-        let items = rows.iter().map(project_from_row).collect::<Result<Vec<_>>>()?;
-        Ok(ProjectPage { items, limit: limit as u32, offset: offset as u32, total })
+        let items = rows
+            .iter()
+            .map(project_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ProjectPage {
+            items,
+            limit: limit as u32,
+            offset: offset as u32,
+            total,
+        })
     }
 
     pub async fn update(
@@ -237,7 +265,8 @@ impl ProjectRepository {
         .bind(description.as_deref())
         .bind(status.map(|v| v.as_str()))
         .fetch_optional(&self.pool)
-        .await?;
+        .await
+        .map_err(map_project_unique_violation)?;
         row.as_ref().map(project_from_row).transpose()
     }
 
@@ -291,20 +320,41 @@ impl ProjectRepository {
         )
         .bind(id)
         .fetch_optional(&mut **tx)
-        .await?
+        .await
+        .map_err(map_project_unique_violation)?
         .is_some();
         Ok(deleted)
     }
 }
 
+fn map_project_unique_violation(err: sqlx::Error) -> anyhow::Error {
+    if let sqlx::Error::Database(db_error) = &err {
+        if db_error.code().as_deref() == Some("23505")
+            && db_error
+                .constraint()
+                .map(|name| name == "projects_name_unique_idx")
+                .unwrap_or(false)
+        {
+            return anyhow!("project name already exists");
+        }
+    }
+    err.into()
+}
+
 fn validate_name(name: &str) -> Result<String> {
     let normalized = name.trim();
-    if normalized.is_empty() { return Err(anyhow!("project name cannot be empty")); }
-    if normalized.len() > 120 { return Err(anyhow!("project name must be 120 characters or fewer")); }
+    if normalized.is_empty() {
+        return Err(anyhow!("project name cannot be empty"));
+    }
+    if normalized.len() > 120 {
+        return Err(anyhow!("project name must be 120 characters or fewer"));
+    }
     Ok(normalized.to_string())
 }
 
-fn normalize_description(description: &str) -> String { description.trim().to_string() }
+fn normalize_description(description: &str) -> String {
+    description.trim().to_string()
+}
 
 fn project_from_row(row: &PgRow) -> Result<Project> {
     Ok(Project {
@@ -339,7 +389,10 @@ mod tests {
 
     #[test]
     fn project_statuses_parse() {
-        assert_eq!(ProjectStatus::parse("active").unwrap(), ProjectStatus::Active);
+        assert_eq!(
+            ProjectStatus::parse("active").unwrap(),
+            ProjectStatus::Active
+        );
         assert!(ProjectStatus::parse("bad").is_err());
     }
 }

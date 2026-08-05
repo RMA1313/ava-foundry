@@ -55,6 +55,8 @@ Responsibilities:
 
 - Preserve source identity
 - Record import information
+- Store source configuration and failure state
+- Track file and byte counts
 - Track ingestion status
 
 A source exists independently of whether media processing succeeds.
