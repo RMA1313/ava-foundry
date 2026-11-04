@@ -20,7 +20,7 @@ walkdir = "2"
 csv = "1"
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+zip = "9"
 parquet = { version = "53", features = ["json"] }
 sha2 = "0.10"
 url = "2"
